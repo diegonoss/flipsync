@@ -1,0 +1,49 @@
+{
+  "name": "flipsync",
+  "version": "1.0.0",
+  "description": "Zero-friction real-time file synchronization across networks via Cloudflare Tunnels, Tailscale, or LAN",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "flipsync": "dist/bin/flipsync.js",
+    "flipsync-host": "dist/bin/flipsync-host.js",
+    "flipsync-client": "dist/bin/flipsync-client.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/run.ts",
+    "test:unit": "tsx tests/run.ts",
+    "host": "tsx bin/flipsync-host.ts",
+    "client": "tsx bin/flipsync-client.ts",
+    "start": "tsx bin/flipsync.ts"
+  },
+  "keywords": [
+    "sync",
+    "file-sync",
+    "real-time",
+    "sse",
+    "cloudflare-tunnel",
+    "tailscale",
+    "cross-network",
+    "zero-install"
+  ],
+  "author": "Flipsi",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "flipsync": "link:"
+  }
+}

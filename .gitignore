@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+*.tsbuildinfo
+
+# FlipSync local dev artifacts
+.sync-token
+.sync-url
+.bin/
+
+# Temporary files
+*.tmp.*
+.DS_Store
+Thumbs.db
+*.log
+
+# CodeGraph
+.codegraph/
