@@ -190,7 +190,13 @@ while ($true) {
         }
 
         if ($res.changed) {
-            if ($res.file) {
+            if ($res.deleted) {
+                $targetFile = Join-Path $ResolvedTarget $res.deleted
+                if (Test-Path $targetFile) {
+                    Remove-Item $targetFile -Force -ErrorAction SilentlyContinue
+                    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] [DELETE] Removed $($res.deleted) (deleted on host)" -ForegroundColor Yellow
+                }
+            } elseif ($res.file) {
                 [void](Sync-File -FileName $res.file.name -ExpectedHash $res.file.sha256 -Size $res.file.size)
             } else {
                 Sync-AllFiles

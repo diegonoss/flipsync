@@ -59,6 +59,12 @@ export interface SyncErrorEvent {
     context?: string;
 }
 
+export interface SyncFileServedEvent {
+    file: string;
+    size: number;
+    clientIp: string;
+}
+
 export interface SyncStartEvent {
     count: number;
     files: string[];
@@ -352,6 +358,15 @@ export class SyncEngine extends EventEmitter {
                 for (const f of files) {
                     this.emit("sync:file-complete", { file: f.name, hash: f.sha256 });
                 }
+
+                if (this.server) {
+                    this.server.notifyPollWaiters({
+                        changed: true,
+                        timestamp: Date.now(),
+                        manifest
+                    });
+                    this.server.broadcast("manifest_refresh", { timestamp: Date.now() });
+                }
             }
             this.status = "idle";
             this.emit("sync:idle");
@@ -457,6 +472,16 @@ export class SyncEngine extends EventEmitter {
                 this.watcher.startWatching();
                 this.stats.totalFiles = Object.keys(manifest.files).length;
 
+                if (this.server) {
+                    this.server.setSyncDir(this.syncDir, this.watcher);
+                    this.server.notifyPollWaiters({
+                        changed: true,
+                        timestamp: Date.now(),
+                        manifest
+                    });
+                    this.server.broadcast("manifest_refresh", { timestamp: Date.now() });
+                }
+
                 const endpointsList: string[] = [];
                 if (this.localUrl) endpointsList.push(this.localUrl);
                 if (this.lanUrl) endpointsList.push(this.lanUrl);
@@ -555,7 +580,15 @@ export class SyncEngine extends EventEmitter {
             syncDir: this.syncDir,
             token: this.token,
             scriptsDir: this.scriptsDir,
-            verbose: false
+            verbose: false,
+            watcher: this.watcher
+        });
+
+        this.server.on("file_served", (event: { file: string; size: number; clientIp: string }) => {
+            this.stats.syncedFiles++;
+            this.stats.bytesTransferred += event.size;
+            this.stats.lastSyncTime = Date.now();
+            this.emit("sync:file-served", event);
         });
 
         try {

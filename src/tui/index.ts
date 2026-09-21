@@ -1,5 +1,6 @@
 import blessed from "blessed";
 import { openFolderPicker } from "./folderPicker.js";
+import { openCommandModal } from "./commandModal.js";
 import type {
     SyncEngine,
     SyncEngineReadyEvent,
@@ -7,7 +8,8 @@ import type {
     SyncFileProgressEvent,
     SyncFileCompleteEvent,
     SyncConflictEvent,
-    SyncErrorEvent
+    SyncErrorEvent,
+    SyncFileServedEvent
 } from "../core/SyncEngine.js";
 
 export interface TuiOptions {
@@ -210,7 +212,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         const state = engine.getState();
         const statusText = state.isPaused ? "PAUSED (press p to resume)" : state.status.toUpperCase();
         footerBox.setContent(
-            ` {bold}[q]{/} Quit  {bold}[p]{/} Pause/Resume  {bold}[r]{/} Force Re-hash  {bold}[f]{/} Select Folder  {bold}[↑/↓]{/} Scroll Log  |  State: {bold}${statusText}{/}`
+            ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[r]{/} Re-hash  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
         );
     };
 
@@ -218,7 +220,9 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         renderHeader();
         renderTransferPanel();
         renderFooter();
-        screen.render();
+        if (!isPickerOpen && !isCommandModalOpen) {
+            screen.render();
+        }
     };
 
     // Wire up SyncEngine events to TUI
@@ -242,6 +246,12 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     engine.on("sync:file-complete", (event: SyncFileCompleteEvent) => {
         addLog("COMPLETE", `Synchronized {bold}${event.file}{/} (${event.hash.slice(0, 8)}...)`, "green");
+        updateAll();
+    });
+
+    engine.on("sync:file-served", (event: SyncFileServedEvent) => {
+        const kb = (event.size / 1024).toFixed(1);
+        addLog("SERVED", `Sent {bold}${event.file}{/} (${kb} KB) to ${event.clientIp}`, "cyan");
         updateAll();
     });
 
@@ -277,6 +287,8 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     // Keybindings & Shutdown
     let isExiting = false;
     let isPickerOpen = false;
+    let isCommandModalOpen = false;
+    let activeCommandModal: { close: () => void } | null = null;
 
     const cleanExit = async (code = 0): Promise<void> => {
         if (isExiting) return;
@@ -284,6 +296,15 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
         if (renderInterval) {
             clearInterval(renderInterval);
+        }
+
+        if (activeCommandModal) {
+            try {
+                activeCommandModal.close();
+            } catch {
+                // Ignore
+            }
+            activeCommandModal = null;
         }
 
         try {
@@ -303,8 +324,22 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         process.exit(code);
     };
 
+    const showCommandModal = () => {
+        if (isPickerOpen || isCommandModalOpen) return;
+        isCommandModalOpen = true;
+
+        activeCommandModal = openCommandModal(screen, {
+            state: engine.getState(),
+            onClose: () => {
+                isCommandModalOpen = false;
+                activeCommandModal = null;
+                updateAll();
+            }
+        });
+    };
+
     const showFolderSelector = (isInitial = false) => {
-        if (isPickerOpen) return;
+        if (isPickerOpen || isCommandModalOpen) return;
         isPickerOpen = true;
 
         openFolderPicker(
@@ -338,21 +373,34 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         );
     };
 
+    screen.key(["c", "C"], () => {
+        if (isPickerOpen) return;
+        if (isCommandModalOpen) {
+            activeCommandModal?.close();
+        } else {
+            showCommandModal();
+        }
+    });
+
     screen.key(["q", "C-c"], () => {
+        if (isCommandModalOpen) {
+            activeCommandModal?.close();
+            return;
+        }
         if (!isPickerOpen) {
             cleanExit(0);
         }
     });
 
     screen.key(["p", "P"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             engine.togglePause();
             updateAll();
         }
     });
 
     screen.key(["r", "R"], async () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             addLog("REHASH", "Forcing full directory re-hash...", "cyan");
             updateAll();
             await engine.forceRehash();
@@ -362,34 +410,34 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     });
 
     screen.key(["f", "F"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             showFolderSelector(false);
         }
     });
 
     screen.key(["up", "k"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             logBox.scroll(-1);
             screen.render();
         }
     });
 
     screen.key(["down", "j"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             logBox.scroll(1);
             screen.render();
         }
     });
 
     screen.key(["pageup"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             logBox.scroll(-5);
             screen.render();
         }
     });
 
     screen.key(["pagedown"], () => {
-        if (!isPickerOpen) {
+        if (!isPickerOpen && !isCommandModalOpen) {
             logBox.scroll(5);
             screen.render();
         }
@@ -401,7 +449,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     // Periodic UI refresh for speed calculations and clock
     const renderInterval = setInterval(() => {
-        if (!isExiting && !isPickerOpen) {
+        if (!isExiting && !isPickerOpen && !isCommandModalOpen) {
             updateAll();
         }
     }, 500);

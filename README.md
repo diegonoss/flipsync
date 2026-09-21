@@ -137,13 +137,15 @@ flipsync host --dir ./dist --tunnel
 flipsync host --dir ./dist --port 7890 --token my-secret-token
 ```
 
-When the host starts, it displays a banner with:
+When the host starts, it displays an interactive TUI dashboard (or banner in headless mode) with:
 - Localhost URL
 - Local LAN IP (for machines on the same Wi-Fi / subnet)
 - Tailscale IP (if active)
 - Public Cloudflare URL (if `--tunnel` is passed)
 - Auth token
 - Ready-to-copy one-liners for Windows, Linux/macOS, and Node.js
+
+> **TUI Tip**: Press **`c`** at any time inside the interactive TUI to open the **Client Connection Commands** modal with quick one-keystroke clipboard copying (`[w]` for Windows, `[l]` for Linux/macOS, `[n]` for Node.js)!
 
 ---
 

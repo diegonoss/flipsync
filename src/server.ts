@@ -1,18 +1,19 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { URL, fileURLToPath } from "node:url";
 import { DirectoryWatcher } from "./watcher.js";
 import type { ServerOptions, ServerInfo, SyncFileMeta } from "./types.js";
 
-export class SyncServer {
+export class SyncServer extends EventEmitter {
     private readonly port: number;
     private readonly host: string;
-    private readonly syncDir: string;
+    private syncDir: string;
     private readonly token?: string;
     private readonly verbose: boolean;
     private readonly scriptsDir?: string;
-    private readonly watcher: DirectoryWatcher;
+    private watcher: DirectoryWatcher;
     private server: http.Server | null = null;
     private activeClients = new Set<http.ServerResponse>();
     private pollWaiters = new Set<{ res: http.ServerResponse; timer: NodeJS.Timeout }>();
@@ -20,14 +21,19 @@ export class SyncServer {
     private keepaliveTimer: NodeJS.Timeout | null = null;
 
     constructor(options: ServerOptions) {
+        super();
         this.port = options.port ?? 7890;
         this.host = options.host ?? "0.0.0.0";
         this.syncDir = path.resolve(options.syncDir ?? options.distDir ?? ".");
         this.token = options.token;
         this.verbose = options.verbose ?? true;
         this.scriptsDir = options.scriptsDir;
-        this.watcher = new DirectoryWatcher(this.syncDir, options.debounceMs ?? 150);
+        this.watcher = options.watcher ?? new DirectoryWatcher(this.syncDir, options.debounceMs ?? 150);
 
+        this.bindWatcherEvents();
+    }
+
+    public bindWatcherEvents(): void {
         this.watcher.on("change", (file: SyncFileMeta) => {
             this.lastChangeTime = Date.now();
             if (this.verbose) {
@@ -59,9 +65,17 @@ export class SyncServer {
             this.notifyPollWaiters({
                 changed: true,
                 timestamp: this.lastChangeTime,
-                filename
+                deleted: filename
             });
         });
+    }
+
+    public setSyncDir(newDir: string, newWatcher?: DirectoryWatcher): void {
+        this.syncDir = path.resolve(newDir);
+        if (newWatcher) {
+            this.watcher = newWatcher;
+            this.bindWatcherEvents();
+        }
     }
 
     public getWatcher(): DirectoryWatcher {
@@ -134,7 +148,7 @@ export class SyncServer {
     }
 
     public getConnectedClientsCount(): number {
-        return this.activeClients.size;
+        return this.activeClients.size + this.pollWaiters.size;
     }
 
     private startKeepalive(): void {
@@ -149,7 +163,7 @@ export class SyncServer {
         }, 15000);
     }
 
-    private broadcast(eventName: string, data: unknown): void {
+    public broadcast(eventName: string, data: unknown): void {
         const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
         for (const client of this.activeClients) {
             try {
@@ -160,7 +174,7 @@ export class SyncServer {
         }
     }
 
-    private notifyPollWaiters(data: unknown): void {
+    public notifyPollWaiters(data: unknown): void {
         const json = JSON.stringify(data);
         for (const waiter of this.pollWaiters) {
             clearTimeout(waiter.timer);
@@ -304,7 +318,7 @@ export class SyncServer {
                         res.writeHead(200, { "Content-Type": "application/json" });
                         res.end(JSON.stringify({
                             changed: false,
-                            timestamp: this.lastChangeTime
+                            timestamp: Date.now()
                         }));
                     } catch {
                         // Ignore
@@ -347,6 +361,7 @@ export class SyncServer {
             }
 
             const meta = this.watcher.getFileMeta(filename);
+            const stat = fs.statSync(safePath);
             const ext = path.extname(filename).toLowerCase();
             let contentType = "application/octet-stream";
             if (ext === ".js" || ext === ".mjs") contentType = "application/javascript";
@@ -356,7 +371,7 @@ export class SyncServer {
 
             res.writeHead(200, {
                 "Content-Type": contentType,
-                "Content-Length": fs.statSync(safePath).size,
+                "Content-Length": stat.size,
                 "ETag": meta ? `"${meta.sha256}"` : undefined,
                 "X-File-SHA256": meta ? meta.sha256 : undefined,
                 "Cache-Control": "no-cache"
@@ -364,6 +379,13 @@ export class SyncServer {
 
             const stream = fs.createReadStream(safePath);
             stream.pipe(res);
+
+            const clientIp = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "client";
+            this.emit("file_served", {
+                file: filename,
+                size: stat.size,
+                clientIp
+            });
             return;
         }
 

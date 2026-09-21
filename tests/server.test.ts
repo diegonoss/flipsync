@@ -77,6 +77,18 @@ export async function testServer(): Promise<void> {
         assert.equal(traversalRes2.status, 400);
 
         // 10. Nonexistent file -> 404
+        let fileServedEvent: any = null;
+        server.on("file_served", (evt) => {
+            fileServedEvent = evt;
+        });
+
+        const dlRes2 = await fetch(`${localUrl}/api/download/test.txt?token=${token}`);
+        assert.equal(dlRes2.status, 200);
+        await dlRes2.text();
+        assert.ok(fileServedEvent);
+        assert.equal(fileServedEvent.file, "test.txt");
+        assert.ok(fileServedEvent.size > 0);
+
         const notFoundRes = await fetch(`${localUrl}/api/download/missing.txt?token=${token}`);
         assert.equal(notFoundRes.status, 404);
 

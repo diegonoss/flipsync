@@ -33,6 +33,7 @@ export interface ServerOptions {
     scriptsDir?: string;
     verbose?: boolean;
     debounceMs?: number;
+    watcher?: any; // DirectoryWatcher instance
 }
 
 export interface ClientOptions {
