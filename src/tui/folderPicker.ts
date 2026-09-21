@@ -101,6 +101,10 @@ export function openFolderPicker(
                 bg: "blue",
                 fg: "white",
                 bold: true
+            },
+            item: {
+                bg: "black",
+                fg: "white"
             }
         },
         tags: true
@@ -130,13 +134,13 @@ export function openFolderPicker(
         );
 
         const items: string[] = [
-            `{bold}{green-fg}✔  [Select Current Folder: ${folderName}]{/}`,
-            `{bold}{cyan-fg}✏  [Enter Custom Path...]{/}`,
-            `📁  ../ (Parent Directory)`
+            `{bold}{green-fg}[✓] [Select Current Folder: ${folderName}]{/}`,
+            `{bold}{cyan-fg}[+] [Enter Custom Path...]{/}`,
+            `{yellow-fg}▸{/}   ../ (Parent Directory)`
         ];
 
         for (const sub of currentSubdirs) {
-            items.push(`📁  ${sub}/`);
+            items.push(`{blue-fg}▸{/}   ${sub}/`);
         }
 
         list.setItems(items);
