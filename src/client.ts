@@ -90,7 +90,9 @@ export class SyncClient {
             }
         } catch (err: unknown) {
             const error = err instanceof Error ? err : new Error(String(err));
-            console.error(`[CLIENT] Failed to sync manifest: ${error.message}`);
+            if (this.verbose) {
+                console.error(`[CLIENT] Failed to sync manifest: ${error.message}`);
+            }
             this.onError?.(error);
             if (this.once) {
                 throw error;
@@ -163,7 +165,10 @@ export class SyncClient {
             },
             (res) => {
                 if (res.statusCode !== 200) {
-                    console.error(`[CLIENT] SSE connection rejected: HTTP ${res.statusCode}`);
+                    if (this.verbose) {
+                        console.error(`[CLIENT] SSE connection rejected: HTTP ${res.statusCode}`);
+                    }
+                    this.onError?.(new Error(`SSE connection rejected: HTTP ${res.statusCode}`));
                     this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
                     return;
                 }
@@ -194,7 +199,10 @@ export class SyncClient {
 
                 res.on("error", (err) => {
                     if (!this.isRunning) return;
-                    console.error(`[CLIENT] SSE stream error: ${err.message}`);
+                    if (this.verbose) {
+                        console.error(`[CLIENT] SSE stream error: ${err.message}`);
+                    }
+                    this.onError?.(err);
                 });
             }
         );
@@ -203,7 +211,10 @@ export class SyncClient {
 
         req.on("error", (err) => {
             if (!this.isRunning) return;
-            console.error(`[CLIENT] Connection error: ${err.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
+            if (this.verbose) {
+                console.error(`[CLIENT] Connection error: ${err.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
+            }
+            this.onError?.(err);
             this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
         });
 
@@ -247,7 +258,11 @@ export class SyncClient {
             const parsed = JSON.parse(data) as SyncEvent;
             if (eventType === "file_changed" && parsed.file) {
                 this.downloadIfChanged(parsed.file).catch((err: unknown) => {
-                    console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${(err as Error).message}`);
+                    const error = err instanceof Error ? err : new Error(String(err));
+                    if (this.verbose) {
+                        console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${error.message}`);
+                    }
+                    this.onError?.(error);
                 });
             } else if (eventType === "file_deleted" && parsed.filename) {
                 const targetFile = path.join(this.targetDir, parsed.filename);

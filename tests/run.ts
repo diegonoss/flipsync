@@ -3,6 +3,8 @@ import { testWatcher } from "./watcher.test.js";
 import { testServer } from "./server.test.js";
 import { testEndToEnd } from "./e2e.test.js";
 import { testStandaloneClients } from "./standalone.test.js";
+import { testSyncEngine, testHeadlessCli } from "./engine.test.js";
+import { testCliExecution } from "./cli.test.js";
 
 async function runAll(): Promise<void> {
     const divider = "=".repeat(64);
@@ -18,6 +20,9 @@ async function runAll(): Promise<void> {
         await testServer();
         await testEndToEnd();
         await testStandaloneClients();
+        await testSyncEngine();
+        await testHeadlessCli();
+        await testCliExecution();
 
         const duration = Date.now() - start;
         console.log(`\n${divider}`);

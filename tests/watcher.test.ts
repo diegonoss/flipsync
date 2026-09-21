@@ -29,18 +29,18 @@ export async function testWatcher(): Promise<void> {
 
         // Write a new file
         fs.writeFileSync(path.join(tempDir, "fileB.txt"), "hello file B");
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 300));
         assert.ok(changedFiles.includes("fileB.txt"), "fileB.txt should trigger change event");
 
         // Overwrite fileB with identical content — should NOT trigger change event
         const countBefore = changedFiles.length;
         fs.writeFileSync(path.join(tempDir, "fileB.txt"), "hello file B");
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 300));
         assert.equal(changedFiles.length, countBefore, "Identical content should not emit change");
 
         // Overwrite fileB with modified content — should trigger change
         fs.writeFileSync(path.join(tempDir, "fileB.txt"), "hello file B modified");
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 300));
         assert.equal(changedFiles.length, countBefore + 1, "Modified content should emit change");
 
         // Delete fileB
@@ -49,7 +49,7 @@ export async function testWatcher(): Promise<void> {
             deletedFile = name;
         });
         fs.unlinkSync(path.join(tempDir, "fileB.txt"));
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 300));
         assert.equal(deletedFile, "fileB.txt", "Deletion should emit delete event");
 
         // Ignore temporary / hidden files

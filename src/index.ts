@@ -10,6 +10,24 @@ export {
     findCloudflaredBinary,
     isCommandAvailable
 } from "./tunnel.js";
+export { SyncEngine } from "./core/SyncEngine.js";
+export { runHeadlessCli } from "./cli/index.js";
+export { runTui } from "./tui/index.js";
+export type {
+    SyncEngineRole,
+    SyncEngineStatus,
+    SyncEngineOptions,
+    SyncFileProgressEvent,
+    SyncFileCompleteEvent,
+    SyncConflictEvent,
+    SyncErrorEvent,
+    SyncStartEvent,
+    SyncEngineReadyEvent,
+    ActiveTransfer,
+    SyncEngineState
+} from "./core/SyncEngine.js";
+export type { HeadlessCliOptions, HeadlessCliController } from "./cli/index.js";
+export type { TuiOptions, TuiController } from "./tui/index.js";
 export type {
     SyncFileMeta,
     SyncManifest,

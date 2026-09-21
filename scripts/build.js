@@ -7,11 +7,18 @@ async function build() {
 
     // Ensure output directories exist
     fs.mkdirSync("dist/bin", { recursive: true });
+    fs.mkdirSync("dist/core", { recursive: true });
+    fs.mkdirSync("dist/cli", { recursive: true });
+    fs.mkdirSync("dist/tui", { recursive: true });
 
     // 1. Build library and CLI with esbuild
     await esbuild.build({
         entryPoints: {
             "index": "src/index.ts",
+            "core/SyncEngine": "src/core/SyncEngine.ts",
+            "core/index": "src/core/index.ts",
+            "cli/index": "src/cli/index.ts",
+            "tui/index": "src/tui/index.ts",
             "bin/flipsync": "bin/flipsync.ts",
             "bin/flipsync-host": "bin/flipsync-host.ts",
             "bin/flipsync-client": "bin/flipsync-client.ts"

@@ -38,12 +38,15 @@
   "author": "Flipsi",
   "license": "MIT",
   "devDependencies": {
+    "@types/blessed": "^0.1.27",
     "@types/node": "^22.13.9",
     "esbuild": "^0.25.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   },
   "dependencies": {
+    "blessed": "^0.1.81",
+    "commander": "^15.0.0",
     "flipsync": "link:"
   }
 }

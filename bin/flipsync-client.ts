@@ -1,89 +1,94 @@
 #!/usr/bin/env node
-import path from "node:path";
-import { SyncClient } from "../src/client.js";
+import { Command } from "commander";
+import { SyncEngine } from "../src/core/SyncEngine.js";
+import { runHeadlessCli } from "../src/cli/index.js";
+import { runTui } from "../src/tui/index.js";
 
-function printHelp(): void {
-    console.log(`
-FlipSync Client — Real-time file sync client
+interface ClientCliOptions {
+    server: string;
+    token?: string;
+    target?: string;
+    once?: boolean;
+    tui?: boolean;
+    headless?: boolean;
+    quiet?: boolean;
+    format?: "text" | "json";
+}
 
-Usage:
-  flipsync-client --server <url> [options]
-  flipsync client --server <url> [options]
-
-Options:
-  -s, --server <url>     FlipSync host URL (http/https) [required]
-  -t, --token <secret>   Authentication token (if host requires one)
-  --target <path>        Target directory to sync files into (default: current directory ".")
-  --once                 Sync current files once and exit immediately
-  -q, --quiet            Suppress verbose output
-  --help                 Show this help message
-
-Environment variables:
-  SYNC_SERVER            Same as --server
-  SYNC_TOKEN             Same as --token
-  SYNC_TARGET            Same as --target
-
-Examples:
-  flipsync-client --server https://abc-xyz.trycloudflare.com --token mysecret --target ./downloads
-  flipsync-client --server http://192.168.1.100:7890 --once
-`);
+function determineExecutionMode(options: ClientCliOptions): "tui" | "headless" {
+    if (options.headless === true || options.tui === false) {
+        return "headless";
+    }
+    if (options.tui === true) {
+        return "tui";
+    }
+    if (process.stdin.isTTY && process.stdout.isTTY) {
+        return "tui";
+    }
+    return "headless";
 }
 
 async function main(): Promise<void> {
-    const args = process.argv.slice(2);
+    const program = new Command();
 
-    if (args.includes("--help") || args.includes("-help")) {
-        printHelp();
-        process.exit(0);
-    }
+    program
+        .name("flipsync-client")
+        .description("FlipSync Client — Real-time file sync client with interactive TUI and headless CLI")
+        .version("1.0.0")
+        .requiredOption("-s, --server <url>", "FlipSync host URL (http/https)")
+        .option("-t, --token <secret>", "Authentication token (if host requires one)")
+        .option("--target <path>", "Target directory to sync files into (default: '.')")
+        .option("--once", "Sync current files once and exit immediately")
+        .option("--tui", "Launch interactive Terminal User Interface (default in TTY)")
+        .option("--headless", "Run headless background daemon with structured stdout/stderr")
+        .option("--no-tui", "Disable TUI and run in headless mode")
+        .option("-q, --quiet", "Suppress non-essential progress output in headless mode")
+        .option("--format <format>", "Output format for headless mode (text or json)", "text");
 
-    const getArg = (shortFlag: string, longFlag: string): string | undefined => {
-        const sIdx = args.indexOf(shortFlag);
-        if (sIdx !== -1 && sIdx + 1 < args.length) return args[sIdx + 1];
-        const lIdx = args.indexOf(longFlag);
-        if (lIdx !== -1 && lIdx + 1 < args.length) return args[lIdx + 1];
-        return undefined;
-    };
+    await program.parseAsync(process.argv);
+    const options = program.opts<ClientCliOptions>();
 
-    const hasFlag = (shortFlag: string, longFlag: string): boolean =>
-        args.includes(shortFlag) || args.includes(longFlag);
+    const execMode = determineExecutionMode(options);
 
-    const serverUrl = getArg("-s", "--server") || process.env.SYNC_SERVER;
-    if (!serverUrl) {
-        console.error("[ERROR] Missing required option: --server <url>");
-        printHelp();
-        process.exit(1);
-    }
-
-    const token = getArg("-t", "--token") || process.env.SYNC_TOKEN;
-    const targetDir = path.resolve(getArg("", "--target") || process.env.SYNC_TARGET || ".");
-    const once = hasFlag("", "--once");
-    const verbose = !hasFlag("-q", "--quiet");
-
-    const client = new SyncClient({
-        serverUrl,
-        token,
-        targetDir,
-        once,
-        verbose
+    const engine = new SyncEngine({
+        role: "client",
+        serverUrl: options.server,
+        token: options.token,
+        targetDir: options.target,
+        syncDir: options.target,
+        once: options.once
     });
 
-    const shutdown = (): void => {
-        console.log("\n[CLIENT] Disconnecting FlipSync client...");
-        client.stop();
-        process.exit(0);
-    };
+    const hasExplicitDir = Boolean(options.target || process.env.SYNC_TARGET);
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    if (execMode === "tui") {
+        try {
+            await runTui(engine, { promptFolderOnStart: !hasExplicitDir });
+        } catch (err: unknown) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            process.stderr.write(`[WARN] TUI initialization failed: ${error.message}. Falling back to headless mode.\n`);
+            await runHeadlessCli(engine, {
+                format: options.format,
+                quiet: options.quiet
+            });
+            await engine.start();
+        }
+    } else {
+        await runHeadlessCli(engine, {
+            format: options.format,
+            quiet: options.quiet
+        });
+        await engine.start();
+    }
 
-    await client.start();
-    if (once) {
+    if (options.once) {
+        await engine.stop();
         process.exit(0);
     }
 }
 
-main().catch((err) => {
-    console.error("[CLIENT] Fatal error:", err);
+main().catch((err: unknown) => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    process.stderr.write(`[CLIENT] Fatal error: ${error.message}\n`);
     process.exit(1);
 });
