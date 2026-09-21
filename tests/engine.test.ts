@@ -191,6 +191,12 @@ export async function testSyncEngine(): Promise<void> {
         } finally {
             await clientEngine.stop();
         }
+
+        // Test that client without token rejects on start
+        const unauthEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir });
+        await assert.rejects(() => unauthEngine.start(), { message: /Authentication failed/ });
+        assert.equal(unauthEngine.getState().status, "stopped");
+        assert.equal((unauthEngine as any).isRunning, false);
     } finally {
         await hostEngine.stop();
         fs.rmSync(hostDir, { recursive: true, force: true });

@@ -59,6 +59,13 @@ async function main(): Promise<void> {
         once: options.once
     });
 
+    engine.on("sync:error", (evt) => {
+        if (evt.context === "auth" || evt.context === "reconnect:limit") {
+            process.stderr.write(`[CLIENT] Fatal: ${evt.error.message}\n`);
+            engine.stop().finally(() => process.exit(1));
+        }
+    });
+
     const hasExplicitDir = Boolean(options.target || process.env.SYNC_TARGET);
 
     if (execMode === "tui") {

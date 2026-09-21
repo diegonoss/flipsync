@@ -4,11 +4,8 @@ import { EventEmitter } from "node:events";
 import { computeFileHash } from "./hasher.js";
 import type { SyncFileMeta, SyncManifest } from "./types.js";
 
-export interface WatcherEvents {
-    change: (file: SyncFileMeta) => void;
-    delete: (filename: string) => void;
-    error: (err: Error) => void;
-}
+const isIgnored = (name: string) =>
+    name.startsWith(".") || name.includes(".tmp.") || name === "node_modules";
 
 export class DirectoryWatcher extends EventEmitter {
     private readonly syncDir: string;
@@ -25,100 +22,67 @@ export class DirectoryWatcher extends EventEmitter {
     }
 
     public async initScan(): Promise<SyncManifest> {
-        if (!fs.existsSync(this.syncDir)) {
-            fs.mkdirSync(this.syncDir, { recursive: true });
-        }
+        fs.mkdirSync(this.syncDir, { recursive: true });
 
-        const scanDirectory = async (dir: string, relativePrefix = ""): Promise<void> => {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                // Ignore hidden files, temporary files, node_modules, and git directories
-                if (
-                    entry.name.startsWith(".") ||
-                    entry.name.includes(".tmp.") ||
-                    entry.name === "node_modules"
-                ) {
-                    continue;
-                }
+        const scan = async (dir: string, prefix = ""): Promise<void> => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (isIgnored(entry.name)) continue;
 
-                const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+                const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
                 const fullPath = path.join(dir, entry.name);
 
                 if (entry.isDirectory()) {
-                    await scanDirectory(fullPath, relativePath);
+                    await scan(fullPath, relPath);
                 } else if (entry.isFile()) {
                     const meta = await computeFileHash(fullPath);
                     if (meta) {
-                        this.cache.set(relativePath, {
-                            name: relativePath,
-                            size: meta.size,
-                            sha256: meta.sha256,
-                            mtimeMs: meta.mtimeMs
-                        });
+                        this.cache.set(relPath, { name: relPath, ...meta });
                     }
                 }
             }
         };
 
-        await scanDirectory(this.syncDir);
+        await scan(this.syncDir);
         return this.getManifest();
     }
 
     public startWatching(): void {
         if (this.isClosed || this.fsWatcher) return;
 
-        if (!fs.existsSync(this.syncDir)) {
-            fs.mkdirSync(this.syncDir, { recursive: true });
-        }
+        fs.mkdirSync(this.syncDir, { recursive: true });
 
         try {
-            this.fsWatcher = fs.watch(this.syncDir, { recursive: true }, (eventType, filename) => {
+            this.fsWatcher = fs.watch(this.syncDir, { recursive: true }, (_eventType, filename) => {
                 if (!filename) return;
 
-                // Normalize slashes for cross-platform consistency
                 const normalized = filename.split(path.sep).join("/");
-
-                // Ignore hidden files, temp files, and node_modules
-                const parts = normalized.split("/");
-                if (parts.some((p) => p.startsWith(".") || p.includes(".tmp.") || p === "node_modules")) {
-                    return;
-                }
+                if (normalized.split("/").some(isIgnored)) return;
 
                 this.scheduleEvaluation(normalized);
             });
 
-            this.fsWatcher.on("error", (err) => {
-                this.emit("error", err);
-            });
+            this.fsWatcher.on("error", (err) => this.emit("error", err));
         } catch (err: unknown) {
             this.emit("error", err instanceof Error ? err : new Error(String(err)));
         }
     }
 
     public getManifest(): SyncManifest {
-        const files: Record<string, SyncFileMeta> = {};
-        for (const [name, meta] of this.cache.entries()) {
-            files[name] = { ...meta };
-        }
         return {
             serverTime: Date.now(),
             syncPath: this.syncDir,
-            files
+            files: Object.fromEntries(this.cache)
         };
     }
 
     public getFileMeta(filename: string): SyncFileMeta | undefined {
-        const normalized = filename.split(path.sep).join("/");
-        return this.cache.get(normalized);
+        return this.cache.get(filename.split(path.sep).join("/"));
     }
 
     private scheduleEvaluation(relPath: string): void {
         if (this.isClosed) return;
 
-        const existingTimer = this.pendingTimers.get(relPath);
-        if (existingTimer) {
-            clearTimeout(existingTimer);
-        }
+        clearTimeout(this.pendingTimers.get(relPath));
 
         const timer = setTimeout(async () => {
             this.pendingTimers.delete(relPath);
@@ -126,32 +90,21 @@ export class DirectoryWatcher extends EventEmitter {
 
             const fullPath = path.join(this.syncDir, relPath);
             if (!fs.existsSync(fullPath)) {
-                if (this.cache.has(relPath)) {
-                    this.cache.delete(relPath);
+                if (this.cache.delete(relPath)) {
                     this.emit("delete", relPath);
                 }
                 return;
             }
-
-            const stat = fs.statSync(fullPath);
-            if (!stat.isFile()) return;
 
             const meta = await computeFileHash(fullPath);
             if (!meta) return;
 
             const existing = this.cache.get(relPath);
             if (existing && existing.sha256 === meta.sha256 && existing.size === meta.size) {
-                // Content unchanged; suppress redundant event
                 return;
             }
 
-            const updated: SyncFileMeta = {
-                name: relPath,
-                size: meta.size,
-                sha256: meta.sha256,
-                mtimeMs: meta.mtimeMs
-            };
-
+            const updated: SyncFileMeta = { name: relPath, ...meta };
             this.cache.set(relPath, updated);
             this.emit("change", updated);
         }, this.debounceMs);
@@ -166,10 +119,8 @@ export class DirectoryWatcher extends EventEmitter {
         }
         this.pendingTimers.clear();
 
-        if (this.fsWatcher) {
-            this.fsWatcher.close();
-            this.fsWatcher = null;
-        }
+        this.fsWatcher?.close();
+        this.fsWatcher = null;
     }
 }
 

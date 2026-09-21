@@ -39,20 +39,36 @@ echo "  Server:      $SERVER"
 echo "  Destination: $TARGET"
 if [[ -n "$TOKEN" ]]; then
     echo "  Auth:        Bearer Token Configured"
+    TOKEN_QUERY="?token=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
 else
     echo "  Auth:        None (Open Access)"
+    TOKEN_QUERY=""
 fi
 echo "================================================================"
 
 calc_sha256() {
-    local file="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file" | awk '{print $1}'
-    else
-        node -e "const fs=require('fs'),crypto=require('crypto');console.log(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'))" "$file"
+    local f="$1"
+    command -v sha256sum >/dev/null 2>&1 && sha256sum "$f" | awk '{print $1}' && return
+    command -v shasum >/dev/null 2>&1 && shasum -a 256 "$f" | awk '{print $1}' && return
+    node -e "console.log(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))" "$f"
+}
+
+check_auth() {
+    local code="$1"
+    local ctx="${2:-}"
+    if [[ "$code" == "401" || "$code" == "403" ]]; then
+        echo "[CLIENT] [FATAL] Authentication failed${ctx:+ $ctx} (HTTP $code). A valid bearer token is required." >&2
+        exit 1
     fi
+}
+
+curl_fetch() {
+    local url="$1"
+    local out="$2"
+    local code
+    code="$(curl -s -w "%{http_code}" -o "$out" "$url" || echo "000")"
+    check_auth "$code" "${3:-}"
+    [[ "$code" == "200" ]]
 }
 
 sync_file() {
@@ -63,31 +79,22 @@ sync_file() {
     parent_dir="$(dirname "$dest")"
     mkdir -p "$parent_dir"
 
-    if [[ -f "$dest" ]]; then
-        local current_hash
-        current_hash="$(calc_sha256 "$dest")"
-        if [[ "$current_hash" == "$expected_hash" ]]; then
-            return 0
-        fi
+    if [[ -f "$dest" && "$(calc_sha256 "$dest")" == "$expected_hash" ]]; then
+        return 0
     fi
 
-    local encoded_name
-    encoded_name="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$name" 2>/dev/null || echo "$name")"
-    local url="$SERVER/api/download/$encoded_name"
-    if [[ -n "$TOKEN" ]]; then
-        local encoded_token
-        encoded_token="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
-        url="$url?token=$encoded_token"
-    fi
+    local enc_name tmp="$parent_dir/.$(basename "$name").tmp.$$"
+    enc_name="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$name" 2>/dev/null || echo "$name")"
 
-    local tmp="$parent_dir/.$(basename "$name").tmp.$$"
-    curl -sSfL "$url" -o "$tmp"
-    local downloaded_hash
-    downloaded_hash="$(calc_sha256 "$tmp")"
-
-    if [[ "$downloaded_hash" != "$expected_hash" ]]; then
+    if ! curl_fetch "$SERVER/api/download/$enc_name$TOKEN_QUERY" "$tmp" "downloading $name"; then
         rm -f "$tmp"
-        echo "[ERROR] Checksum mismatch for $name!"
+        echo "[ERROR] Download failed for $name" >&2
+        return 1
+    fi
+
+    if [[ "$(calc_sha256 "$tmp")" != "$expected_hash" ]]; then
+        rm -f "$tmp"
+        echo "[ERROR] Checksum mismatch for $name!" >&2
         return 1
     fi
 
@@ -96,24 +103,24 @@ sync_file() {
 }
 
 sync_manifest() {
-    local url="$SERVER/api/manifest"
-    if [[ -n "$TOKEN" ]]; then
-        local encoded_token
-        encoded_token="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
-        url="$url?token=$encoded_token"
+    local tmp_manifest
+    tmp_manifest="$(mktemp)"
+    if ! curl_fetch "$SERVER/api/manifest$TOKEN_QUERY" "$tmp_manifest"; then
+        rm -f "$tmp_manifest"
+        echo "[CLIENT] [ERROR] Manifest request failed" >&2
+        [[ "$ONCE" == "true" ]] && exit 1
+        return 1
     fi
-
-    local manifest_json
-    manifest_json="$(curl -sSfL "$url")"
 
     node -e '
         const manifest = JSON.parse(process.argv[1]);
         for (const [name, meta] of Object.entries(manifest.files || {})) {
             console.log(`${meta.name}\t${meta.sha256}\t${meta.size}`);
         }
-    ' "$manifest_json" | while IFS=$'\t' read -r fname fhash fsize; do
+    ' "$(cat "$tmp_manifest")" | while IFS=$'\t' read -r fname fhash fsize; do
         sync_file "$fname" "$fhash"
     done
+    rm -f "$tmp_manifest"
 }
 
 # Initial synchronization
@@ -126,33 +133,40 @@ fi
 
 echo "[CLIENT] Listening for real-time file updates..."
 
-BACKOFF=2
+BACKOFF=1
+MAX_BACKOFF=30
+
 while true; do
-    url="$SERVER/api/events"
-    if [[ -n "$TOKEN" ]]; then
-        local encoded_token
-        encoded_token="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
-        url="$url?token=$encoded_token"
+    if [[ $BACKOFF -gt $MAX_BACKOFF ]]; then
+        echo "[CLIENT] [FATAL] Connection lost. Retry timer (${BACKOFF}s) exceeded limit (${MAX_BACKOFF}s). Terminating." >&2
+        exit 1
     fi
 
-    # Stream SSE via curl
-    curl -N -sSfL -H "Accept: text/event-stream" "$url" | while read -r line; do
+    curl_err="$(mktemp)"
+    curl -N -sS -f -H "Accept: text/event-stream" "$SERVER/api/events$TOKEN_QUERY" 2>"$curl_err" | while read -r line; do
         if [[ "$line" =~ ^event:[[:space:]]*file_changed ]]; then
             read -r data_line
             if [[ "$data_line" =~ ^data:[[:space:]]*(.*) ]]; then
-                json_str="${BASH_REMATCH[1]}"
                 node -e '
                     const d = JSON.parse(process.argv[1]);
                     if (d.file) console.log(`${d.file.name}\t${d.file.sha256}\t${d.file.size}`);
-                ' "$json_str" | while IFS=$'\t' read -r fname fhash fsize; do
+                ' "${BASH_REMATCH[1]}" | while IFS=$'\t' read -r fname fhash fsize; do
                     sync_file "$fname" "$fhash"
                 done
             fi
         fi
     done || true
 
+    err_output="$(cat "$curl_err" 2>/dev/null || echo "")"
+    rm -f "$curl_err"
+
+    if [[ "$err_output" =~ 401|403 ]]; then
+        echo "[CLIENT] [FATAL] Authentication failed on event stream. A valid bearer token is required." >&2
+        exit 1
+    fi
+
     echo "[CLIENT] Connection interrupted. Reconnecting in ${BACKOFF}s..."
     sleep "$BACKOFF"
-    BACKOFF=$(( BACKOFF < 15 ? BACKOFF * 2 : 15 ))
-    sync_manifest
+    BACKOFF=$(( BACKOFF * 2 ))
+    sync_manifest || true
 done

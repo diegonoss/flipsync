@@ -19,12 +19,15 @@ function computeHash(buf) {
 
 function getFileHash(filePath) {
     try {
-        if (!fs.existsSync(filePath)) return null;
-        const buf = fs.readFileSync(filePath);
-        return computeHash(buf);
+        return fs.existsSync(filePath) ? computeHash(fs.readFileSync(filePath)) : null;
     } catch {
         return null;
     }
+}
+
+function fatal(msg) {
+    console.error(`[CLIENT] [FATAL] ${msg}`);
+    process.exit(1);
 }
 
 class Client {
@@ -61,13 +64,14 @@ class Client {
         if (this.activeReq) this.activeReq.destroy();
     }
 
+    url(endpoint) {
+        return `${this.server}${endpoint}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
+    }
+
     async syncAll() {
         try {
-            const url = `${this.server}/api/manifest${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-            const res = await this.httpGet(url);
-            if (res.status !== 200) {
-                throw new Error(`HTTP ${res.status}: ${res.body}`);
-            }
+            const res = await this.httpGet(this.url("/api/manifest"));
+            if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.body}`);
             const manifest = JSON.parse(res.body);
             const files = Object.values(manifest.files || {});
             let updated = 0;
@@ -94,8 +98,7 @@ class Client {
         }
 
         const start = Date.now();
-        const url = `${this.server}/api/download/${encodeURIComponent(file.name)}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-        const buf = await this.httpDownload(url);
+        const buf = await this.httpDownload(this.url(`/api/download/${encodeURIComponent(file.name)}`));
 
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
@@ -113,11 +116,14 @@ class Client {
         return true;
     }
 
-    connectSse(backoff) {
+    connectSse(backoff = 1000) {
         if (!this.running) return;
 
-        const urlStr = `${this.server}/api/events${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-        const parsed = new URL(urlStr);
+        if (backoff > 30000) {
+            fatal(`Connection lost. Retry timer (${(backoff / 1000).toFixed(1)}s) exceeded limit (30.0s). Terminating.`);
+        }
+
+        const parsed = new URL(this.url("/api/events"));
         const transport = parsed.protocol === "https:" ? https : http;
 
         const req = transport.request(
@@ -126,13 +132,19 @@ class Client {
                 headers: { Accept: "text/event-stream", "Cache-Control": "no-cache" }
             },
             (res) => {
+                if (res.statusCode === 401 || res.statusCode === 403) {
+                    fatal(`Authentication failed (HTTP ${res.statusCode}). A valid bearer token is required.`);
+                }
+
                 if (res.statusCode !== 200) {
                     console.error(`[CLIENT] [ERROR] SSE stream rejected: HTTP ${res.statusCode}`);
-                    this.retry(Math.min(backoff * 2, 15000));
+                    this.retry(backoff);
                     return;
                 }
 
                 console.log("[CLIENT] Live sync active. Waiting for file changes on host...");
+
+                backoff = 1000;
 
                 let buffer = "";
                 res.on("data", (chunk) => {
@@ -143,11 +155,13 @@ class Client {
                 });
 
                 res.on("end", () => {
+                    if (!this.running) return;
                     console.log("[CLIENT] Stream ended by host.");
-                    this.retry(Math.min(backoff * 2, 15000));
+                    this.retry(backoff);
                 });
 
                 res.on("error", (err) => {
+                    if (!this.running) return;
                     console.error(`[CLIENT] [ERROR] Stream error: ${err.message}`);
                 });
             }
@@ -157,7 +171,7 @@ class Client {
         req.on("error", (err) => {
             if (!this.running) return;
             console.error(`[CLIENT] Connection error: ${err.message}. Retrying in ${(backoff / 1000).toFixed(1)}s...`);
-            this.retry(Math.min(backoff * 2, 15000));
+            this.retry(backoff);
         });
         req.end();
     }
@@ -168,15 +182,18 @@ class Client {
         this.reconnectTimer = setTimeout(async () => {
             if (!this.running) return;
             console.log("[CLIENT] Reconnecting to host...");
-            await this.syncAll();
-            this.connectSse(delay);
+            try {
+                await this.syncAll();
+            } catch (err) {
+                console.error(`[CLIENT] [ERROR] Reconnect sync failed: ${err.message}`);
+            }
+            this.connectSse(delay * 2);
         }, delay);
     }
 
     handleSseMessage(msg) {
         if (!msg || msg.startsWith(":")) return;
-        let event = "message";
-        let data = "";
+        let event = "message", data = "";
         for (const line of msg.split("\n")) {
             if (line.startsWith("event:")) event = line.slice(6).trim();
             else if (line.startsWith("data:")) data = line.slice(5).trim();
@@ -190,61 +207,43 @@ class Client {
                     console.error(`[CLIENT] [ERROR] Failed update: ${e.message}`)
                 );
             } else if (event === "file_deleted" && parsed.filename) {
-                const targetPath = path.join(this.target, parsed.filename);
-                if (fs.existsSync(targetPath)) {
-                    try {
-                        fs.unlinkSync(targetPath);
-                    } catch {
-                        // Ignore
-                    }
-                }
+                try { fs.unlinkSync(path.join(this.target, parsed.filename)); } catch {}
                 console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
             }
-        } catch {
-            // Ignore malformed JSON
-        }
+        } catch {}
     }
 
-    httpGet(urlStr) {
+    httpReq(urlStr, asBuffer = false) {
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);
-            const transport = parsed.protocol === "https:" ? https : http;
-            transport
+            (parsed.protocol === "https:" ? https : http)
                 .get(parsed, (res) => {
-                    let body = "";
-                    res.on("data", (c) => (body += c));
-                    res.on("end", () => resolve({ status: res.statusCode || 0, body }));
-                })
-                .on("error", reject);
-        });
-    }
-
-    httpDownload(urlStr) {
-        return new Promise((resolve, reject) => {
-            const parsed = new URL(urlStr);
-            const transport = parsed.protocol === "https:" ? https : http;
-            transport
-                .get(parsed, (res) => {
-                    if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+                    if (res.statusCode === 401 || res.statusCode === 403) {
+                        fatal(`Authentication failed (HTTP ${res.statusCode}). A valid bearer token is required.`);
+                    }
+                    if (asBuffer && res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
                     const chunks = [];
                     res.on("data", (c) => chunks.push(c));
-                    res.on("end", () => resolve(Buffer.concat(chunks)));
+                    res.on("end", () => {
+                        const buf = Buffer.concat(chunks);
+                        resolve(asBuffer ? buf : { status: res.statusCode || 0, body: buf.toString("utf8") });
+                    });
                 })
                 .on("error", reject);
         });
     }
+
+    httpGet(urlStr) { return this.httpReq(urlStr, false); }
+    httpDownload(urlStr) { return this.httpReq(urlStr, true); }
 }
 
 // CLI entrypoint
 const args = process.argv.slice(2);
-const getArg = (shortFlag, longFlag) => {
-    const s = args.indexOf(shortFlag);
-    if (s !== -1 && s + 1 < args.length) return args[s + 1];
-    const l = args.indexOf(longFlag);
-    if (l !== -1 && l + 1 < args.length) return args[l + 1];
-    return undefined;
+const getArg = (s, l) => {
+    const i = Math.max(args.indexOf(s), args.indexOf(l));
+    return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
 };
-const hasFlag = (shortFlag, longFlag) => args.includes(shortFlag) || args.includes(longFlag);
+const hasFlag = (s, l) => args.includes(s) || args.includes(l);
 
 if (hasFlag("-h", "--help")) {
     console.log(`
@@ -265,8 +264,7 @@ Options:
 
 const server = getArg("-s", "--server") || process.env.SYNC_SERVER;
 if (!server) {
-    console.error("[ERROR] Missing required option: --server <URL>");
-    console.error("Run with --help for details.");
+    console.error("[ERROR] Missing required option: --server <URL>\nRun with --help for details.");
     process.exit(1);
 }
 
@@ -285,13 +283,8 @@ const onExit = () => {
 process.on("SIGINT", onExit);
 process.on("SIGTERM", onExit);
 
-client
-    .start()
-    .then(() => {
-        if (client.once) {
-            process.exit(0);
-        }
-    })
+client.start()
+    .then(() => { if (client.once) process.exit(0); })
     .catch((err) => {
         console.error("[CLIENT] [FATAL]", err.message);
         process.exit(1);

@@ -739,12 +739,27 @@ export class SyncEngine extends EventEmitter {
         await scanDir(this.syncDir);
     }
 
+    private url(endpoint: string): string {
+        return `${this.serverUrl}${endpoint}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
+    }
+
+    private failFatal(message: string, context: string): Error {
+        const error = new Error(message);
+        this.stats.errorsCount++;
+        this.emit("sync:error", { error, context });
+        this.status = "error";
+        this.stop();
+        return error;
+    }
+
     public async syncManifest(): Promise<void> {
         if (!this.serverUrl) return;
 
         try {
-            const manifestUrl = `${this.serverUrl}/api/manifest${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-            const res = await this.httpRequest(manifestUrl);
+            const res = await this.httpRequest(this.url("/api/manifest"));
+            if (res.statusCode === 401 || res.statusCode === 403) {
+                throw this.failFatal(`Authentication failed: HTTP ${res.statusCode} (valid bearer token required)`, "auth");
+            }
             if (res.statusCode !== 200) {
                 throw new Error(`Server returned HTTP ${res.statusCode}: ${res.body}`);
             }
@@ -789,6 +804,7 @@ export class SyncEngine extends EventEmitter {
             this.emit("sync:idle");
         } catch (err: unknown) {
             const error = err instanceof Error ? err : new Error(String(err));
+            if (error.message.includes("Authentication failed")) throw error;
             this.stats.errorsCount++;
             this.emit("sync:error", { error, context: "syncManifest" });
             if (this.syncOnce) throw error;
@@ -836,7 +852,7 @@ export class SyncEngine extends EventEmitter {
             }
         }
 
-        const downloadUrl = `${this.serverUrl}/api/download/${encodeURIComponent(file.name)}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
+        const downloadUrl = this.url(`/api/download/${encodeURIComponent(file.name)}`);
         const startTime = Date.now();
         let lastUpdateTime = startTime;
         let lastTransferred = 0;
@@ -861,6 +877,10 @@ export class SyncEngine extends EventEmitter {
                 const transport = isHttps ? https : http;
 
                 const req = transport.get(parsed, (res) => {
+                    if (res.statusCode === 401 || res.statusCode === 403) {
+                        reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
+                        return;
+                    }
                     if (res.statusCode !== 200) {
                         reject(new Error(`Download failed with status ${res.statusCode}`));
                         return;
@@ -910,6 +930,7 @@ export class SyncEngine extends EventEmitter {
         } catch (err: unknown) {
             this.activeTransfersMap.delete(file.name);
             const error = err instanceof Error ? err : new Error(String(err));
+            if (error.message.includes("Authentication failed")) throw error;
             this.stats.errorsCount++;
             this.emit("sync:error", { error, context: `download:${file.name}` });
             throw error;
@@ -954,13 +975,16 @@ export class SyncEngine extends EventEmitter {
         return true;
     }
 
-    private connectSse(retryDelayMs: number): void {
+    private connectSse(retryDelayMs = 1000): void {
         if (!this.isRunning || !this.serverUrl) return;
 
-        const sseUrl = `${this.serverUrl}/api/events${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-        const parsed = new URL(sseUrl);
-        const isHttps = parsed.protocol === "https:";
-        const transport = isHttps ? https : http;
+        if (retryDelayMs > 30000) {
+            this.failFatal(`Connection lost: retry timer (${(retryDelayMs / 1000).toFixed(1)}s) exceeded limit (30.0s)`, "reconnect:limit");
+            return;
+        }
+
+        const parsed = new URL(this.url("/api/events"));
+        const transport = parsed.protocol === "https:" ? https : http;
 
         const req = transport.request(
             parsed,
@@ -971,43 +995,40 @@ export class SyncEngine extends EventEmitter {
                 }
             },
             (res) => {
-                if (res.statusCode !== 200) {
-                    const err = new Error(`SSE connection rejected: HTTP ${res.statusCode}`);
-                    this.emit("sync:error", { error: err, context: "sse:status" });
-                    this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+                if (res.statusCode === 401 || res.statusCode === 403) {
+                    this.failFatal(`Authentication failed: HTTP ${res.statusCode} (valid bearer token required)`, "auth");
                     return;
                 }
 
-                let buffer = "";
+                if (res.statusCode !== 200) {
+                    const err = new Error(`SSE connection rejected: HTTP ${res.statusCode}`);
+                    this.emit("sync:error", { error: err, context: "sse:status" });
+                    this.scheduleReconnect(retryDelayMs);
+                    return;
+                }
 
+                retryDelayMs = 1000;
+
+                let buffer = "";
                 res.on("data", (chunk: Buffer) => {
                     buffer += chunk.toString("utf8");
                     const parts = buffer.split("\n\n");
                     buffer = parts.pop() || "";
-
-                    for (const part of parts) {
-                        this.processSseMessage(part.trim());
-                    }
+                    for (const part of parts) this.processSseMessage(part.trim());
                 });
 
-                res.on("end", () => {
-                    if (!this.isRunning) return;
-                    this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
-                });
-
-                res.on("error", (err) => {
-                    if (!this.isRunning) return;
-                    this.emit("sync:error", { error: err, context: "sse:stream" });
-                });
+                res.on("end", () => { if (this.isRunning) this.scheduleReconnect(retryDelayMs); });
+                res.on("error", (err) => { if (this.isRunning) this.emit("sync:error", { error: err, context: "sse:stream" }); });
             }
         );
 
         this.currentSseReq = req;
 
         req.on("error", (err) => {
-            if (!this.isRunning) return;
-            this.emit("sync:error", { error: err, context: "sse:request" });
-            this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+            if (this.isRunning) {
+                this.emit("sync:error", { error: err, context: "sse:request" });
+                this.scheduleReconnect(retryDelayMs);
+            }
         });
 
         req.end();
@@ -1021,10 +1042,10 @@ export class SyncEngine extends EventEmitter {
             if (!this.isRunning) return;
             try {
                 await this.syncManifest();
-            } catch {
-                // Ignore during reconnect
+            } catch (err: unknown) {
+                if (err instanceof Error && err.message.includes("Authentication failed")) return;
             }
-            this.connectSse(delayMs);
+            this.connectSse(delayMs * 2);
         }, delayMs);
     }
 

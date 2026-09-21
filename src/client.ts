@@ -29,9 +29,7 @@ export class SyncClient {
         await this.syncManifest();
 
         if (this.options.once) {
-            if (this.verbose) {
-                console.log("[CLIENT] Initial sync complete (--once specified). Exiting.");
-            }
+            if (this.verbose) console.log("[CLIENT] Initial sync complete (--once specified). Exiting.");
             return;
         }
 
@@ -40,22 +38,26 @@ export class SyncClient {
 
     public stop(): void {
         this.isRunning = false;
-        if (this.reconnectTimeout) {
-            clearTimeout(this.reconnectTimeout);
-            this.reconnectTimeout = null;
-        }
-        if (this.abortController) {
-            this.abortController.abort();
-            this.abortController = null;
-        }
+        if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+        this.abortController?.abort();
+        this.reconnectTimeout = this.abortController = null;
+    }
+
+    private fail(message: string): Error {
+        const error = new Error(message);
+        if (this.verbose) console.error(`[CLIENT] [FATAL] ${message}`);
+        this.options.onError?.(error);
+        this.stop();
+        return error;
     }
 
     public async syncManifest(): Promise<void> {
         try {
             const res = await fetch(this.url("/api/manifest"));
-            if (!res.ok) {
-                throw new Error(`Server returned HTTP ${res.status}: ${await res.text()}`);
+            if (res.status === 401 || res.status === 403) {
+                throw this.fail(`Authentication failed: HTTP ${res.status} (valid bearer token required)`);
             }
+            if (!res.ok) throw new Error(`Server returned HTTP ${res.status}: ${await res.text()}`);
 
             const manifest = (await res.json()) as SyncManifest;
             const files = Object.values(manifest.files || {});
@@ -70,9 +72,8 @@ export class SyncClient {
             }
         } catch (err: unknown) {
             const error = err instanceof Error ? err : new Error(String(err));
-            if (this.verbose) {
-                console.error(`[CLIENT] Failed to sync manifest: ${error.message}`);
-            }
+            if (error.message.includes("Authentication failed")) throw error;
+            if (this.verbose) console.error(`[CLIENT] Failed to sync manifest: ${error.message}`);
             this.options.onError?.(error);
             if (this.options.once) throw error;
         }
@@ -83,15 +84,14 @@ export class SyncClient {
         const destDir = path.dirname(destPath);
         fs.mkdirSync(destDir, { recursive: true });
 
-        if (await verifyFileHash(destPath, file.sha256)) {
-            return false;
-        }
+        if (await verifyFileHash(destPath, file.sha256)) return false;
 
         const startMs = Date.now();
         const res = await fetch(this.url(`/api/download/${encodeURIComponent(file.name)}`));
-        if (!res.ok) {
-            throw new Error(`Download failed with status ${res.status}`);
+        if (res.status === 401 || res.status === 403) {
+            throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
         }
+        if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
 
         const buffer = Buffer.from(await res.arrayBuffer());
         const downloadedHash = computeBufferHash(buffer);
@@ -112,8 +112,13 @@ export class SyncClient {
         return true;
     }
 
-    private async connectSse(retryDelayMs: number): Promise<void> {
+    private async connectSse(retryDelayMs = 1000): Promise<void> {
         if (!this.isRunning) return;
+
+        if (retryDelayMs > 30000) {
+            this.fail(`Connection lost: retry timer (${(retryDelayMs / 1000).toFixed(1)}s) exceeded limit (30.0s)`);
+            return;
+        }
 
         const controller = new AbortController();
         this.abortController = controller;
@@ -124,42 +129,39 @@ export class SyncClient {
                 signal: controller.signal
             });
 
-            if (res.status !== 200) {
-                if (this.verbose) {
-                    console.error(`[CLIENT] SSE connection rejected: HTTP ${res.status}`);
-                }
-                this.options.onError?.(new Error(`SSE connection rejected: HTTP ${res.status}`));
-                this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+            if (res.status === 401 || res.status === 403) {
+                this.fail(`Authentication failed: HTTP ${res.status} (valid bearer token required)`);
                 return;
             }
 
-            if (this.verbose) {
-                console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
+            if (!res.ok) {
+                if (this.verbose) console.error(`[CLIENT] SSE connection rejected: HTTP ${res.status}`);
+                this.options.onError?.(new Error(`SSE connection rejected: HTTP ${res.status}`));
+                this.scheduleReconnect(retryDelayMs);
+                return;
             }
+
+            if (this.verbose) console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
+
+            retryDelayMs = 1000;
 
             let buffer = "";
             for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
                 buffer += Buffer.from(chunk).toString("utf8");
                 const parts = buffer.split("\n\n");
                 buffer = parts.pop() || "";
-                for (const part of parts) {
-                    this.processSseMessage(part.trim());
-                }
+                for (const part of parts) this.processSseMessage(part.trim());
             }
 
             if (!this.isRunning) return;
-            if (this.verbose) {
-                console.log("[CLIENT] SSE connection closed by server.");
-            }
-            this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+            if (this.verbose) console.log("[CLIENT] SSE connection closed by server.");
+            this.scheduleReconnect(retryDelayMs);
         } catch (err: unknown) {
             if (!this.isRunning || (err instanceof Error && err.name === "AbortError")) return;
             const error = err instanceof Error ? err : new Error(String(err));
-            if (this.verbose) {
-                console.error(`[CLIENT] Connection error: ${error.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
-            }
+            if (this.verbose) console.error(`[CLIENT] Connection error: ${error.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
             this.options.onError?.(error);
-            this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+            this.scheduleReconnect(retryDelayMs);
         }
     }
 
@@ -169,28 +171,23 @@ export class SyncClient {
 
         this.reconnectTimeout = setTimeout(async () => {
             if (!this.isRunning) return;
-            if (this.verbose) {
-                console.log("[CLIENT] Reconnecting...");
+            if (this.verbose) console.log("[CLIENT] Reconnecting...");
+            try {
+                await this.syncManifest();
+            } catch (err: unknown) {
+                if (err instanceof Error && err.message.includes("Authentication failed")) return;
             }
-            await this.syncManifest();
-            this.connectSse(delayMs);
+            this.connectSse(delayMs * 2);
         }, delayMs);
     }
 
     private processSseMessage(message: string): void {
         if (!message || message.startsWith(":")) return;
-
-        let eventType = "message";
-        let data = "";
-
+        let eventType = "message", data = "";
         for (const line of message.split("\n")) {
-            if (line.startsWith("event:")) {
-                eventType = line.slice(6).trim();
-            } else if (line.startsWith("data:")) {
-                data = line.slice(5).trim();
-            }
+            if (line.startsWith("event:")) eventType = line.slice(6).trim();
+            else if (line.startsWith("data:")) data = line.slice(5).trim();
         }
-
         if (!data) return;
 
         try {
@@ -198,25 +195,15 @@ export class SyncClient {
             if (eventType === "file_changed" && parsed.file) {
                 this.downloadIfChanged(parsed.file).catch((err: unknown) => {
                     const error = err instanceof Error ? err : new Error(String(err));
-                    if (this.verbose) {
-                        console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${error.message}`);
-                    }
+                    if (this.verbose) console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${error.message}`);
                     this.options.onError?.(error);
                 });
             } else if (eventType === "file_deleted" && parsed.filename) {
-                try {
-                    fs.unlinkSync(path.join(this.targetDir, parsed.filename));
-                } catch {
-                    // File may not exist or be locked
-                }
-                if (this.verbose) {
-                    console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
-                }
+                try { fs.unlinkSync(path.join(this.targetDir, parsed.filename)); } catch {}
+                if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
                 this.options.onDelete?.(parsed.filename);
             }
-        } catch {
-            // Ignore malformed payloads
-        }
+        } catch {}
     }
 
     private url(endpoint: string): string {

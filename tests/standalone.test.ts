@@ -65,6 +65,21 @@ export async function testStandaloneClients(): Promise<void> {
             const bashData = JSON.parse(fs.readFileSync(path.join(clientDirBash, "data.json"), "utf8"));
             assert.equal(bashData.message, "hello standalone");
         }
+        // 3. Verify standalone clients terminate immediately on 401 when token is missing
+        const expectAuthFailure = (cmd: string) =>
+            new Promise<void>((resolve, reject) => {
+                exec(cmd, (err, _stdout, stderr) => {
+                    if (err && err.code !== 0) {
+                        assert.match(stderr, /Authentication failed/);
+                        resolve();
+                    } else reject(new Error(`Expected "${cmd}" to fail with auth error`));
+                });
+            });
+
+        await expectAuthFailure(`node "${jsScript}" --server "${localUrl}" --target "${clientDirJs}"`);
+        if (process.platform !== "win32") {
+            await expectAuthFailure(`bash "${path.resolve("scripts/sync-client.sh")}" --server "${localUrl}" --target "${clientDirBash}"`);
+        }
     } finally {
         await server.stop();
         fs.rmSync(hostDir, { recursive: true, force: true });

@@ -67,21 +67,26 @@ if ($Token) {
 }
 Write-Host "================================================================`n" -ForegroundColor Cyan
 
+$TokenQuery = if ($Token) { "?token=$([System.Uri]::EscapeDataString($Token))" } else { "" }
+$TokenParam = if ($Token) { "&token=$([System.Uri]::EscapeDataString($Token))" } else { "" }
+
 function Get-FileSha256 {
     param([string]$FilePath)
     if (-not (Test-Path $FilePath)) { return $null }
     try {
-        $stream = [System.IO.File]::OpenRead($FilePath)
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        $hashBytes = $sha.ComputeHash($stream)
-        $stream.Close()
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($b in $hashBytes) {
-            [void]$sb.Append($b.ToString("x2"))
-        }
-        return $sb.ToString()
+        return (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLower()
     } catch {
         return $null
+    }
+}
+
+function Check-AuthError {
+    param($Err, [string]$Context = "")
+    if (($Err.Exception -and $Err.Exception.Response -and [int]$Err.Exception.Response.StatusCode -in 401, 403) -or
+        ("$Err" -match '\b(401|403)\b|Unauthorized|Forbidden')) {
+        $detail = if ($Context) { " $Context" } else { "" }
+        Write-Host "[CLIENT] [FATAL] Authentication failed$detail (HTTP 401/403). A valid bearer token is required." -ForegroundColor Red
+        exit 1
     }
 }
 
@@ -107,11 +112,7 @@ function Sync-File {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $encodedName = [System.Uri]::EscapeDataString($FileName)
-    $downloadUrl = "$Server/api/download/$encodedName"
-    if ($Token) {
-        $downloadUrl += "?token=$([System.Uri]::EscapeDataString($Token))"
-    }
-
+    $downloadUrl = "$Server/api/download/$encodedName$TokenQuery"
     $tempFile = Join-Path $parentDir ".$(Split-Path $FileName -Leaf).tmp.$([System.DateTime]::UtcNow.Ticks)"
     
     try {
@@ -132,6 +133,7 @@ function Sync-File {
         return $true
     } catch {
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        Check-AuthError $_ "downloading $FileName"
         Write-Host "[ERROR] Failed downloading $($FileName): $_" -ForegroundColor Red
         return $false
     }
@@ -139,10 +141,7 @@ function Sync-File {
 
 function Sync-AllFiles {
     try {
-        $manifestUrl = "$Server/api/manifest"
-        if ($Token) {
-            $manifestUrl += "?token=$([System.Uri]::EscapeDataString($Token))"
-        }
+        $manifestUrl = "$Server/api/manifest$TokenQuery"
 
         $res = Invoke-RestMethod -Uri $manifestUrl -UseBasicParsing -UserAgent "FlipSync/1.0"
         $files = $res.files.PSObject.Properties
@@ -158,6 +157,7 @@ function Sync-AllFiles {
         }
         Write-Host "[CLIENT] Manifest checked: $count file(s) verified, $updated updated." -ForegroundColor Cyan
     } catch {
+        Check-AuthError $_
         Write-Host "[CLIENT] Manifest check failed: $_" -ForegroundColor Red
         if ($Once) { throw $_ }
     }
@@ -174,16 +174,18 @@ if ($Once) {
 Write-Host "`n[CLIENT] Listening for real-time file updates from host..." -ForegroundColor Yellow
 
 $lastTime = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$retryDelay = 1
+$maxRetryDelay = 30
 
 while ($true) {
     try {
-        $waitUrl = "$Server/api/wait-change?since=$lastTime"
-        if ($Token) {
-            $waitUrl += "&token=$([System.Uri]::EscapeDataString($Token))"
-        }
+        $waitUrl = "$Server/api/wait-change?since=$lastTime$TokenParam"
 
         # Long-poll: waits on host until a change occurs (up to 25s)
         $res = Invoke-RestMethod -Uri $waitUrl -UseBasicParsing -UserAgent "FlipSync/1.0" -TimeoutSec 35
+
+        # Successful connection, reset retry backoff
+        $retryDelay = 1
 
         if ($res.timestamp) {
             $lastTime = $res.timestamp
@@ -203,12 +205,18 @@ while ($true) {
             }
         }
     } catch {
-        $msg = "$_"
-        if ($msg -match "timed out" -or $msg -match "The operation has timed out") {
+        Check-AuthError $_
+        if ("$_" -match "timed out|The operation has timed out") {
+            $retryDelay = 1
             continue
         }
-        Write-Host "[CLIENT] Connection interrupted: $msg. Reconnecting in 1s..." -ForegroundColor DarkYellow
-        Start-Sleep -Seconds 1
+        if ($retryDelay -gt $maxRetryDelay) {
+            Write-Host "[CLIENT] [FATAL] Connection lost. Retry delay (${retryDelay}s) exceeded limit (${maxRetryDelay}s). Terminating." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "[CLIENT] Connection interrupted: $_. Reconnecting in ${retryDelay}s..." -ForegroundColor DarkYellow
+        Start-Sleep -Seconds $retryDelay
+        $retryDelay = $retryDelay * 2
         Sync-AllFiles
         $lastTime = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     }

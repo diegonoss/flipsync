@@ -76,6 +76,24 @@ export async function testEndToEnd(): Promise<void> {
 
         assert.equal(fs.existsSync(path.join(clientDir, "nested/newfile.txt")), false);
         assert.ok(deletedFiles.includes("nested/newfile.txt"));
+
+        // 6. Verify client without token rejects with authentication error
+        const unauthClient = new SyncClient({ serverUrl: localUrl, targetDir: clientDir, verbose: false });
+        await assert.rejects(() => unauthClient.start(), { message: /Authentication failed/ });
+
+        // 7. Verify SyncClient terminates when retry limit is exceeded
+        let reconnectLimitError: any = null;
+        const reconnectClient = new SyncClient({
+            serverUrl: localUrl,
+            targetDir: clientDir,
+            token,
+            verbose: false,
+            onError: (err) => { reconnectLimitError = err; }
+        });
+        (reconnectClient as any).isRunning = true;
+        await (reconnectClient as any).connectSse(35000);
+        assert.match(reconnectLimitError?.message || "", /retry timer .* exceeded limit/);
+        assert.equal((reconnectClient as any).isRunning, false);
     } finally {
         client.stop();
         await server.stop();
