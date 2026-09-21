@@ -8,7 +8,9 @@ export {
     detectTailscaleIp,
     getLocalLanIp,
     findCloudflaredBinary,
-    isCommandAvailable
+    isCommandAvailable,
+    downloadCloudflaredBinary,
+    getCloudflaredDownloadUrl
 } from "./tunnel.js";
 export { SyncEngine } from "./core/SyncEngine.js";
 export { runHeadlessCli } from "./cli/index.js";

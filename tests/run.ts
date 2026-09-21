@@ -6,6 +6,7 @@ import { testStandaloneClients } from "./standalone.test.js";
 import { testSyncEngine, testHeadlessCli } from "./engine.test.js";
 import { testCliExecution } from "./cli.test.js";
 import { testCommandModal } from "./commandModal.test.js";
+import { testTunnel } from "./tunnel.test.js";
 
 async function runAll(): Promise<void> {
     const divider = "=".repeat(64);
@@ -25,6 +26,7 @@ async function runAll(): Promise<void> {
         await testHeadlessCli();
         await testCliExecution();
         await testCommandModal();
+        await testTunnel();
 
         const duration = Date.now() - start;
         console.log(`\n${divider}`);
