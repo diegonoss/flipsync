@@ -1,58 +1,40 @@
-import http from "node:http";
-import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
-import { URL } from "node:url";
-import { computeBufferHash, computeFileHash } from "./hasher.js";
+import { computeBufferHash, verifyFileHash } from "./hasher.js";
 import type { ClientOptions, SyncEvent, SyncFileMeta, SyncManifest } from "./types.js";
 
 export class SyncClient {
     private readonly serverUrl: string;
-    private readonly token?: string;
     private readonly targetDir: string;
     private readonly verbose: boolean;
-    private readonly once: boolean;
-    private readonly onSync?: (file: SyncFileMeta) => void;
-    private readonly onDelete?: (filename: string) => void;
-    private readonly onError?: (err: Error) => void;
     private isRunning = false;
     private reconnectTimeout: NodeJS.Timeout | null = null;
-    private currentSseReq: http.ClientRequest | null = null;
+    private abortController: AbortController | null = null;
 
-    constructor(options: ClientOptions) {
+    constructor(private readonly options: ClientOptions) {
         this.serverUrl = options.serverUrl.replace(/\/+$/, "");
-        this.token = options.token;
         this.targetDir = path.resolve(options.targetDir);
         this.verbose = options.verbose ?? true;
-        this.once = options.once ?? false;
-        this.onSync = options.onSync;
-        this.onDelete = options.onDelete;
-        this.onError = options.onError;
     }
 
     public async start(): Promise<void> {
         this.isRunning = true;
-
-        if (!fs.existsSync(this.targetDir)) {
-            fs.mkdirSync(this.targetDir, { recursive: true });
-        }
+        fs.mkdirSync(this.targetDir, { recursive: true });
 
         if (this.verbose) {
             console.log(`[CLIENT] Connecting to host: ${this.serverUrl}`);
             console.log(`[CLIENT] Target folder:   ${this.targetDir}`);
         }
 
-        // Initial synchronization
         await this.syncManifest();
 
-        if (this.once) {
+        if (this.options.once) {
             if (this.verbose) {
                 console.log("[CLIENT] Initial sync complete (--once specified). Exiting.");
             }
             return;
         }
 
-        // Start real-time SSE connection
         this.connectSse(1000);
     }
 
@@ -62,27 +44,25 @@ export class SyncClient {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
         }
-        if (this.currentSseReq) {
-            this.currentSseReq.destroy();
-            this.currentSseReq = null;
+        if (this.abortController) {
+            this.abortController.abort();
+            this.abortController = null;
         }
     }
 
     public async syncManifest(): Promise<void> {
         try {
-            const manifestUrl = `${this.serverUrl}/api/manifest${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-            const res = await this.httpRequest(manifestUrl);
-            if (res.statusCode !== 200) {
-                throw new Error(`Server returned HTTP ${res.statusCode}: ${res.body}`);
+            const res = await fetch(this.url("/api/manifest"));
+            if (!res.ok) {
+                throw new Error(`Server returned HTTP ${res.status}: ${await res.text()}`);
             }
 
-            const manifest = JSON.parse(res.body) as SyncManifest;
+            const manifest = (await res.json()) as SyncManifest;
             const files = Object.values(manifest.files || {});
 
             let syncedCount = 0;
             for (const file of files) {
-                const updated = await this.downloadIfChanged(file);
-                if (updated) syncedCount++;
+                if (await this.downloadIfChanged(file)) syncedCount++;
             }
 
             if (this.verbose) {
@@ -93,132 +73,94 @@ export class SyncClient {
             if (this.verbose) {
                 console.error(`[CLIENT] Failed to sync manifest: ${error.message}`);
             }
-            this.onError?.(error);
-            if (this.once) {
-                throw error;
-            }
+            this.options.onError?.(error);
+            if (this.options.once) throw error;
         }
     }
 
     public async downloadIfChanged(file: SyncFileMeta): Promise<boolean> {
         const destPath = path.join(this.targetDir, file.name);
         const destDir = path.dirname(destPath);
+        fs.mkdirSync(destDir, { recursive: true });
 
-        if (!fs.existsSync(destDir)) {
-            fs.mkdirSync(destDir, { recursive: true });
-        }
-
-        // Compare with local copy
-        if (fs.existsSync(destPath)) {
-            const localMeta = await computeFileHash(destPath);
-            if (localMeta && localMeta.sha256 === file.sha256) {
-                return false;
-            }
+        if (await verifyFileHash(destPath, file.sha256)) {
+            return false;
         }
 
         const startMs = Date.now();
-        const downloadUrl = `${this.serverUrl}/api/download/${encodeURIComponent(file.name)}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-        const buffer = await this.httpDownloadBuffer(downloadUrl);
+        const res = await fetch(this.url(`/api/download/${encodeURIComponent(file.name)}`));
+        if (!res.ok) {
+            throw new Error(`Download failed with status ${res.status}`);
+        }
 
-        // Verify SHA-256 integrity
+        const buffer = Buffer.from(await res.arrayBuffer());
         const downloadedHash = computeBufferHash(buffer);
         if (downloadedHash !== file.sha256) {
             throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
         }
 
-        // Atomic write: write to temp file, then rename
-        const tempFilename = `.${path.basename(file.name)}.tmp.${Date.now()}`;
-        const tempPath = path.join(destDir, tempFilename);
-
+        const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
         fs.writeFileSync(tempPath, buffer);
         fs.renameSync(tempPath, destPath);
 
-        const durationMs = Date.now() - startMs;
-        const kb = (file.size / 1024).toFixed(1);
-
         if (this.verbose) {
-            console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${durationMs}ms -> ${destPath}`);
+            const kb = (file.size / 1024).toFixed(1);
+            console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${Date.now() - startMs}ms -> ${destPath}`);
         }
 
-        if (this.onSync) {
-            this.onSync(file);
-        }
-
+        this.options.onSync?.(file);
         return true;
     }
 
-    private connectSse(retryDelayMs: number): void {
+    private async connectSse(retryDelayMs: number): Promise<void> {
         if (!this.isRunning) return;
 
-        const sseUrl = `${this.serverUrl}/api/events${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
-        const parsedUrl = new URL(sseUrl);
-        const isHttps = parsedUrl.protocol === "https:";
-        const transport = isHttps ? https : http;
+        const controller = new AbortController();
+        this.abortController = controller;
 
-        const req = transport.request(
-            parsedUrl,
-            {
-                headers: {
-                    Accept: "text/event-stream",
-                    "Cache-Control": "no-cache"
-                }
-            },
-            (res) => {
-                if (res.statusCode !== 200) {
-                    if (this.verbose) {
-                        console.error(`[CLIENT] SSE connection rejected: HTTP ${res.statusCode}`);
-                    }
-                    this.onError?.(new Error(`SSE connection rejected: HTTP ${res.statusCode}`));
-                    this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
-                    return;
-                }
+        try {
+            const res = await fetch(this.url("/api/events"), {
+                headers: { Accept: "text/event-stream", "Cache-Control": "no-cache" },
+                signal: controller.signal
+            });
 
+            if (res.status !== 200) {
                 if (this.verbose) {
-                    console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
+                    console.error(`[CLIENT] SSE connection rejected: HTTP ${res.status}`);
                 }
-
-                let buffer = "";
-
-                res.on("data", (chunk: Buffer) => {
-                    buffer += chunk.toString("utf8");
-                    const parts = buffer.split("\n\n");
-                    buffer = parts.pop() || "";
-
-                    for (const part of parts) {
-                        this.processSseMessage(part.trim());
-                    }
-                });
-
-                res.on("end", () => {
-                    if (!this.isRunning) return;
-                    if (this.verbose) {
-                        console.log("[CLIENT] SSE connection closed by server.");
-                    }
-                    this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
-                });
-
-                res.on("error", (err) => {
-                    if (!this.isRunning) return;
-                    if (this.verbose) {
-                        console.error(`[CLIENT] SSE stream error: ${err.message}`);
-                    }
-                    this.onError?.(err);
-                });
+                this.options.onError?.(new Error(`SSE connection rejected: HTTP ${res.status}`));
+                this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+                return;
             }
-        );
 
-        this.currentSseReq = req;
+            if (this.verbose) {
+                console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
+            }
 
-        req.on("error", (err) => {
+            let buffer = "";
+            for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+                buffer += Buffer.from(chunk).toString("utf8");
+                const parts = buffer.split("\n\n");
+                buffer = parts.pop() || "";
+                for (const part of parts) {
+                    this.processSseMessage(part.trim());
+                }
+            }
+
             if (!this.isRunning) return;
             if (this.verbose) {
-                console.error(`[CLIENT] Connection error: ${err.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
+                console.log("[CLIENT] SSE connection closed by server.");
             }
-            this.onError?.(err);
             this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
-        });
-
-        req.end();
+        } catch (err: unknown) {
+            if (!this.isRunning || (err instanceof Error && err.name === "AbortError")) return;
+            const error = err instanceof Error ? err : new Error(String(err));
+            if (this.verbose) {
+                console.error(`[CLIENT] Connection error: ${error.message}. Retrying in ${(retryDelayMs / 1000).toFixed(1)}s...`);
+            }
+            this.options.onError?.(error);
+            this.scheduleReconnect(Math.min(retryDelayMs * 2, 15000));
+        }
     }
 
     private scheduleReconnect(delayMs: number): void {
@@ -236,19 +178,16 @@ export class SyncClient {
     }
 
     private processSseMessage(message: string): void {
-        if (!message || message.startsWith(":")) {
-            return;
-        }
+        if (!message || message.startsWith(":")) return;
 
-        const lines = message.split("\n");
         let eventType = "message";
         let data = "";
 
-        for (const line of lines) {
+        for (const line of message.split("\n")) {
             if (line.startsWith("event:")) {
-                eventType = line.slice("event:".length).trim();
+                eventType = line.slice(6).trim();
             } else if (line.startsWith("data:")) {
-                data = line.slice("data:".length).trim();
+                data = line.slice(5).trim();
             }
         }
 
@@ -262,64 +201,25 @@ export class SyncClient {
                     if (this.verbose) {
                         console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${error.message}`);
                     }
-                    this.onError?.(error);
+                    this.options.onError?.(error);
                 });
             } else if (eventType === "file_deleted" && parsed.filename) {
-                const targetFile = path.join(this.targetDir, parsed.filename);
-                if (fs.existsSync(targetFile)) {
-                    try {
-                        fs.unlinkSync(targetFile);
-                    } catch {
-                        // File may be locked
-                    }
+                try {
+                    fs.unlinkSync(path.join(this.targetDir, parsed.filename));
+                } catch {
+                    // File may not exist or be locked
                 }
                 if (this.verbose) {
                     console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
                 }
-                this.onDelete?.(parsed.filename);
+                this.options.onDelete?.(parsed.filename);
             }
         } catch {
             // Ignore malformed payloads
         }
     }
 
-    private httpRequest(urlStr: string): Promise<{ statusCode: number; body: string }> {
-        return new Promise((resolve, reject) => {
-            const parsed = new URL(urlStr);
-            const isHttps = parsed.protocol === "https:";
-            const transport = isHttps ? https : http;
-
-            const req = transport.get(parsed, (res) => {
-                let body = "";
-                res.on("data", (chunk: Buffer) => {
-                    body += chunk.toString("utf8");
-                });
-                res.on("end", () => {
-                    resolve({ statusCode: res.statusCode || 0, body });
-                });
-            });
-
-            req.on("error", reject);
-        });
-    }
-
-    private httpDownloadBuffer(urlStr: string): Promise<Buffer> {
-        return new Promise((resolve, reject) => {
-            const parsed = new URL(urlStr);
-            const isHttps = parsed.protocol === "https:";
-            const transport = isHttps ? https : http;
-
-            const req = transport.get(parsed, (res) => {
-                if (res.statusCode !== 200) {
-                    reject(new Error(`Download failed with status ${res.statusCode}`));
-                    return;
-                }
-                const chunks: Buffer[] = [];
-                res.on("data", (chunk: Buffer) => chunks.push(chunk));
-                res.on("end", () => resolve(Buffer.concat(chunks)));
-            });
-
-            req.on("error", reject);
-        });
+    private url(endpoint: string): string {
+        return `${this.serverUrl}${endpoint}${this.options.token ? `?token=${encodeURIComponent(this.options.token)}` : ""}`;
     }
 }
