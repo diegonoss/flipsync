@@ -27,6 +27,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 if (-not $Server) {
     if (Test-Path Variable:s) { $Server = $s }
