@@ -60,7 +60,7 @@ export async function testWatcher(): Promise<void> {
         // Dynamic nested directory creation and file addition
         fs.mkdirSync(path.join(tempDir, "new_sub/deep"), { recursive: true });
         fs.writeFileSync(path.join(tempDir, "new_sub/deep/nested.txt"), "hello deep nested");
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        for (let i = 0; i < 20 && !changedFiles.includes("new_sub/deep/nested.txt"); i++) await new Promise((r) => setTimeout(r, 50));
         assert.ok(changedFiles.includes("new_sub/deep/nested.txt"), "Dynamically added nested file should trigger change event");
 
         // Subdirectory file deletion

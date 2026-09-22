@@ -176,7 +176,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     const renderTransferPanel = () => {
         const state = engine.getState();
-        const active = state.activeTransfers;
+        const active = state.activeTransfers.filter((t) => t.percent < 100);
 
         if (active.length === 0) {
             const lines = [
@@ -192,12 +192,14 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             return;
         }
 
+        const maxLen = Math.max(30, (screen.width as number) - 6);
         const lines: string[] = [];
         for (const t of active.slice(0, 3)) {
             const bar = renderProgressBar(t.percent, 24);
             const speed = formatSpeed(t.speedBps);
             const sizeStr = `${formatBytes(t.transferred)} / ${formatBytes(t.total)}`;
-            lines.push(`{bold}${t.file}{/}`);
+            const name = t.file.length > maxLen ? `${t.file.slice(0, (maxLen - 3) >> 1)}...${t.file.slice(-((maxLen - 3) >> 1))}` : t.file;
+            lines.push(`{bold}${name}{/}`);
             lines.push(`  ${bar}  ${sizeStr}  ({cyan-fg}${speed}{/})`);
         }
 

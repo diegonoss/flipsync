@@ -217,6 +217,7 @@ export async function testSyncEngine(): Promise<void> {
             const lastHostProgress = hostProgressEvents.filter((c) => c.file === "stream-large.bin").pop();
             assert.equal(lastHostProgress?.percent, 100);
             assert.equal(lastHostProgress?.transferred, largeData.length);
+            assert.equal(hostEngine.getState().activeTransfers.length, 0, "No active transfers should linger after transfer completes");
             // Verify no leftover .tmp files
             const clientFiles = fs.readdirSync(clientDir);
             assert.ok(!clientFiles.some((f) => f.includes(".tmp.")), "No temporary files should remain");

@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { finished } from "node:stream";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { DirectoryWatcher } from "./watcher.js";
@@ -266,13 +267,9 @@ export class SyncServer extends EventEmitter {
             });
             stream.on("error", () => res.destroy());
 
-            res.on("finish", () => {
-                this.emit("file_served", { id: transferId, file: filename, size: stat.size, clientIp });
-            });
-            res.on("close", () => {
-                if (!res.writableEnded) {
-                    this.emit("file_aborted", { id: transferId, file: filename, clientIp });
-                }
+            finished(res, (err) => {
+                stream.destroy();
+                this.emit(err ? "file_aborted" : "file_served", { id: transferId, file: filename, size: stat.size, clientIp });
             });
 
             stream.pipe(res);

@@ -52,10 +52,13 @@ export async function testEndToEnd(): Promise<void> {
         syncedFiles.length = 0;
         fs.writeFileSync(path.join(hostDir, "initial.txt"), "version 2 modified");
 
-        // Wait for watcher debounce (150ms) + SSE broadcast
-        await new Promise((resolve) => setTimeout(resolve, 400));
+        const waitUntil = async (fn: () => boolean, timeout = 2500) => {
+            const start = Date.now();
+            while (!fn() && Date.now() - start < timeout) await new Promise((r) => setTimeout(r, 50));
+            assert.ok(fn(), "Condition timed out");
+        };
 
-        assert.equal(fs.readFileSync(path.join(clientDir, "initial.txt"), "utf8"), "version 2 modified");
+        await waitUntil(() => fs.existsSync(path.join(clientDir, "initial.txt")) && fs.readFileSync(path.join(clientDir, "initial.txt"), "utf8") === "version 2 modified");
         assert.equal(syncedFiles.length, 1);
         assert.equal(syncedFiles[0], "initial.txt");
 
@@ -63,18 +66,13 @@ export async function testEndToEnd(): Promise<void> {
         syncedFiles.length = 0;
         fs.writeFileSync(path.join(hostDir, "nested/newfile.txt"), "brand new nested file");
 
-        await new Promise((resolve) => setTimeout(resolve, 400));
-
-        assert.ok(fs.existsSync(path.join(clientDir, "nested/newfile.txt")));
-        assert.equal(fs.readFileSync(path.join(clientDir, "nested/newfile.txt"), "utf8"), "brand new nested file");
+        await waitUntil(() => fs.existsSync(path.join(clientDir, "nested/newfile.txt")) && fs.readFileSync(path.join(clientDir, "nested/newfile.txt"), "utf8") === "brand new nested file");
         assert.equal(syncedFiles.length, 1);
 
         // 5. Simulate host deleting a file
         fs.unlinkSync(path.join(hostDir, "nested/newfile.txt"));
 
-        await new Promise((resolve) => setTimeout(resolve, 400));
-
-        assert.equal(fs.existsSync(path.join(clientDir, "nested/newfile.txt")), false);
+        await waitUntil(() => !fs.existsSync(path.join(clientDir, "nested/newfile.txt")));
         assert.ok(deletedFiles.includes("nested/newfile.txt"));
 
         // 6. Verify client without token rejects with authentication error
