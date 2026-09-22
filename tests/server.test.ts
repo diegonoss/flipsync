@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -107,6 +108,47 @@ export async function testServer(): Promise<void> {
         assert.equal(jsRes.status, 200);
         const jsText = await jsRes.text();
         assert.ok(jsText.includes("FlipSync"));
+
+        // 12. Bundled CLI script serving from external working directory
+        const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-external-dir-"));
+        const hostBin = path.resolve("dist/bin/flipsync-host.js");
+        if (fs.existsSync(hostBin)) {
+            const externalPort = 8991;
+            const hostChild = spawn(process.execPath, [
+                hostBin,
+                "--dir", externalDir,
+                "--port", String(externalPort),
+                "--headless",
+                "--no-token"
+            ], { cwd: externalDir });
+
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error("Timeout waiting for external host")), 6000);
+                    hostChild.stdout.on("data", (d: Buffer) => {
+                        if (d.toString().includes("[READY]")) {
+                            clearTimeout(timer);
+                            resolve();
+                        }
+                    });
+                    hostChild.on("error", (err) => {
+                        clearTimeout(timer);
+                        reject(err);
+                    });
+                });
+
+                const extPs1 = await fetch(`http://127.0.0.1:${externalPort}/client.ps1`);
+                assert.equal(extPs1.status, 200);
+                assert.ok((await extPs1.text()).includes("FlipSync"));
+
+                const extSh = await fetch(`http://127.0.0.1:${externalPort}/client.sh`);
+                assert.equal(extSh.status, 200);
+                assert.ok((await extSh.text()).includes("FlipSync"));
+            } finally {
+                hostChild.kill();
+                fs.rmSync(externalDir, { recursive: true, force: true });
+            }
+        }
     } finally {
         await server.stop();
         fs.rmSync(tempDir, { recursive: true, force: true });

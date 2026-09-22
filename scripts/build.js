@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { execSync } from "node:child_process";
 import * as esbuild from "esbuild";
 
@@ -42,11 +43,22 @@ async function build() {
         console.warn("[BUILD] [WARN] Declaration emit encountered warnings, continuing...");
     }
 
-    // 2. Ensure executable permissions
+    // 2. Copy client scripts to dist/scripts
+    fs.mkdirSync("dist/scripts", { recursive: true });
+    for (const script of ["sync-client.js", "sync-client.sh", "sync-client.ps1"]) {
+        const srcPath = path.join("scripts", script);
+        if (fs.existsSync(srcPath)) {
+            fs.copyFileSync(srcPath, path.join("dist/scripts", script));
+        }
+    }
+
+    // 3. Ensure executable permissions
     const binaries = [
         "dist/bin/flipsync.js",
         "dist/bin/flipsync-host.js",
         "dist/bin/flipsync-client.js",
+        "dist/scripts/sync-client.sh",
+        "dist/scripts/sync-client.js",
         "scripts/sync-client.sh",
         "scripts/sync-client.js"
     ];

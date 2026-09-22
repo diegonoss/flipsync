@@ -86,7 +86,12 @@ class Client {
     }
 
     async downloadIfChanged(file) {
-        const dest = path.join(this.target, file.name);
+        const dest = path.resolve(this.target, file.name);
+        const rel = path.relative(this.target, dest);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            console.error(`[ERROR] Path traversal blocked: ${file.name}`);
+            return false;
+        }
         const parentDir = path.dirname(dest);
         if (!fs.existsSync(parentDir)) {
             fs.mkdirSync(parentDir, { recursive: true });
@@ -207,8 +212,12 @@ class Client {
                     console.error(`[CLIENT] [ERROR] Failed update: ${e.message}`)
                 );
             } else if (event === "file_deleted" && parsed.filename) {
-                try { fs.unlinkSync(path.join(this.target, parsed.filename)); } catch {}
-                console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
+                const dest = path.resolve(this.target, parsed.filename);
+                const rel = path.relative(this.target, dest);
+                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+                    try { fs.unlinkSync(dest); } catch {}
+                    console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
+                }
             }
         } catch {}
     }

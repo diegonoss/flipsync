@@ -216,7 +216,7 @@ export class SyncEngine extends EventEmitter {
             } else {
                 this.token = crypto.randomBytes(16).toString("hex");
                 try {
-                    fs.writeFileSync(tokenFile, this.token, { encoding: "utf8" });
+                    fs.writeFileSync(tokenFile, this.token, { encoding: "utf8", mode: 0o600 });
                 } catch {
                     // Ignore on read-only filesystems
                 }
@@ -812,7 +812,11 @@ export class SyncEngine extends EventEmitter {
     }
 
     public async downloadFileWithProgress(file: SyncFileMeta): Promise<boolean> {
-        const destPath = path.join(this.syncDir, file.name);
+        const destPath = path.resolve(this.syncDir, file.name);
+        const rel = path.relative(this.syncDir, destPath);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            throw new Error(`Path traversal blocked for file: ${file.name}`);
+        }
         const destDir = path.dirname(destPath);
 
         if (!fs.existsSync(destDir)) {
@@ -1091,18 +1095,21 @@ export class SyncEngine extends EventEmitter {
                         this.emit("sync:idle");
                     });
             } else if (eventType === "file_deleted" && parsed.filename) {
-                const targetFile = path.join(this.syncDir, parsed.filename);
-                if (fs.existsSync(targetFile)) {
-                    try {
-                        fs.unlinkSync(targetFile);
-                    } catch {
-                        // Ignore if locked
+                const targetFile = path.resolve(this.syncDir, parsed.filename);
+                const rel = path.relative(this.syncDir, targetFile);
+                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+                    if (fs.existsSync(targetFile)) {
+                        try {
+                            fs.unlinkSync(targetFile);
+                        } catch {
+                            // Ignore if locked
+                        }
                     }
-                }
-                this.syncedHashes.delete(parsed.filename);
-                this.emit("sync:file-deleted", { file: parsed.filename });
-                if (this.activeTransfersMap.size === 0) {
-                    this.emit("sync:idle");
+                    this.syncedHashes.delete(parsed.filename);
+                    this.emit("sync:file-deleted", { file: parsed.filename });
+                    if (this.activeTransfersMap.size === 0) {
+                        this.emit("sync:idle");
+                    }
                 }
             }
         } catch {

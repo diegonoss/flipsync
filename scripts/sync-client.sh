@@ -74,6 +74,10 @@ curl_fetch() {
 sync_file() {
     local name="$1"
     local expected_hash="$2"
+    if [[ "$name" == *".."* || "$name" == /* ]]; then
+        echo "[ERROR] Path traversal blocked for $name" >&2
+        return 1
+    fi
     local dest="$TARGET/$name"
     local parent_dir
     parent_dir="$(dirname "$dest")"

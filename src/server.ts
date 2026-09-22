@@ -1,33 +1,25 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { DirectoryWatcher } from "./watcher.js";
 import type { ServerOptions, ServerInfo, SyncFileMeta } from "./types.js";
 
 const MIME_TYPES: Record<string, string> = {
-    ".js": "application/javascript",
+    ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript",
     ".json": "application/json",
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/plain; charset=utf-8",
-    ".html": "text/html; charset=utf-8"
-};
-
-const SCRIPT_MIME: Record<string, string> = {
-    ps1: "text/plain; charset=utf-8",
-    sh: "text/x-shellscript; charset=utf-8",
-    js: "application/javascript; charset=utf-8"
+    ".html": "text/html; charset=utf-8",
+    ".ps1": "text/plain; charset=utf-8",
+    ".sh": "text/x-shellscript; charset=utf-8"
 };
 
 export class SyncServer extends EventEmitter {
-    private readonly port: number;
-    private readonly host: string;
     private syncDir: string;
-    private readonly token?: string;
-    private readonly verbose: boolean;
-    private readonly scriptsDir?: string;
     private watcher: DirectoryWatcher;
     private server: http.Server | null = null;
     private activeClients = new Set<http.ServerResponse>();
@@ -35,32 +27,25 @@ export class SyncServer extends EventEmitter {
     private lastChangeTime = Date.now();
     private keepaliveTimer: NodeJS.Timeout | null = null;
 
-    constructor(options: ServerOptions) {
+    constructor(private options: ServerOptions) {
         super();
-        this.port = options.port ?? 7890;
-        this.host = options.host ?? "0.0.0.0";
         this.syncDir = path.resolve(options.syncDir ?? options.distDir ?? ".");
-        this.token = options.token;
-        this.verbose = options.verbose ?? true;
-        this.scriptsDir = options.scriptsDir;
         this.watcher = options.watcher ?? new DirectoryWatcher(this.syncDir, options.debounceMs ?? 150);
-
         this.bindWatcherEvents();
     }
 
     public bindWatcherEvents(): void {
+        const verbose = this.options.verbose ?? true;
         this.watcher.on("change", (file: SyncFileMeta) => {
             this.lastChangeTime = Date.now();
-            if (this.verbose) {
-                console.log(`[HOST] File changed: ${file.name} (${(file.size / 1024).toFixed(1)} KB, hash: ${file.sha256.slice(0, 8)}...)`);
-            }
+            if (verbose) console.log(`[HOST] File changed: ${file.name} (${(file.size / 1024).toFixed(1)} KB, hash: ${file.sha256.slice(0, 8)}...)`);
             this.broadcast("file_changed", { type: "file_changed", timestamp: this.lastChangeTime, file });
             this.notifyPollWaiters({ changed: true, timestamp: this.lastChangeTime, file });
         });
 
         this.watcher.on("delete", (filename: string) => {
             this.lastChangeTime = Date.now();
-            if (this.verbose) console.log(`[HOST] File deleted: ${filename}`);
+            if (verbose) console.log(`[HOST] File deleted: ${filename}`);
             this.broadcast("file_deleted", { type: "file_deleted", timestamp: this.lastChangeTime, filename });
             this.notifyPollWaiters({ changed: true, timestamp: this.lastChangeTime, deleted: filename });
         });
@@ -82,14 +67,17 @@ export class SyncServer extends EventEmitter {
         await this.watcher.initScan();
         this.watcher.startWatching();
 
+        const port = this.options.port ?? 7890;
+        const host = this.options.host ?? "0.0.0.0";
+
         return new Promise((resolve, reject) => {
             this.server = http.createServer((req, res) => this.handleRequest(req, res))
                 .on("error", reject)
-                .listen(this.port, this.host, () => {
+                .listen(port, host, () => {
                     const addr = this.server?.address();
-                    const port = typeof addr === "object" && addr ? addr.port : this.port;
-                    this.startKeepalive();
-                    resolve({ port, host: this.host, localUrl: `http://localhost:${port}`, syncDir: this.syncDir });
+                    const actualPort = addr && typeof addr === "object" ? addr.port : port;
+                    this.keepaliveTimer = setInterval(() => this.sendToClients(": keepalive\n\n"), 15000);
+                    resolve({ port: actualPort, host, localUrl: `http://localhost:${actualPort}`, syncDir: this.syncDir });
                 });
         });
     }
@@ -123,51 +111,38 @@ export class SyncServer extends EventEmitter {
         }
     }
 
-    private startKeepalive(): void {
-        this.keepaliveTimer = setInterval(() => this.sendToClients(": keepalive\n\n"), 15000);
-    }
-
     public broadcast(eventName: string, data: unknown): void {
         this.sendToClients(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
     }
 
     public notifyPollWaiters(data: unknown): void {
         const json = JSON.stringify(data);
-        for (const waiter of this.pollWaiters) {
-            clearTimeout(waiter.timer);
+        for (const { res, timer } of this.pollWaiters) {
+            clearTimeout(timer);
             try {
-                waiter.res.writeHead(200, { "Content-Type": "application/json" }).end(json);
-            } catch {
-                // Ignore socket error
-            }
+                res.writeHead(200, { "Content-Type": "application/json" }).end(json);
+            } catch {}
         }
         this.pollWaiters.clear();
     }
 
     private isAuthenticated(req: http.IncomingMessage, parsedUrl: URL): boolean {
-        if (!this.token) return true;
+        if (!this.options.token) return true;
         const token = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]
             ?? parsedUrl.searchParams.get("token");
-        return token === this.token;
+        if (!token) return false;
+        const a = Buffer.from(token);
+        const b = Buffer.from(this.options.token);
+        return a.length === b.length && crypto.timingSafeEqual(a, b);
     }
 
     private resolveClientScript(scriptName: string): string | null {
-        const candidates: (string | undefined | false)[] = [
-            this.scriptsDir && path.join(this.scriptsDir, scriptName)
+        const candidates = [
+            this.options.scriptsDir && path.join(this.options.scriptsDir, scriptName),
+            fileURLToPath(new URL(`../scripts/${scriptName}`, import.meta.url)),
+            fileURLToPath(new URL(`../../scripts/${scriptName}`, import.meta.url)),
+            path.resolve("scripts", scriptName)
         ];
-        try {
-            const dir = path.dirname(fileURLToPath(import.meta.url));
-            candidates.push(
-                path.resolve(dir, "../scripts", scriptName),
-                path.resolve(dir, "../../scripts", scriptName)
-            );
-        } catch {
-            // Ignore fileURLToPath fallback
-        }
-        candidates.push(
-            path.resolve("scripts", scriptName),
-            path.resolve("dist-sync", scriptName)
-        );
         return candidates.find((c): c is string => Boolean(c && fs.existsSync(c))) ?? null;
     }
 
@@ -185,14 +160,17 @@ export class SyncServer extends EventEmitter {
 
         if (req.method === "OPTIONS") return void res.writeHead(204).end();
 
-        // Helper client download endpoints
         const scriptMatch = pathname.match(/^\/(?:sync-)?client\.(ps1|sh|js)$/);
         if (scriptMatch) {
-            const ext = scriptMatch[1];
-            return this.serveFileOrFallback(res, this.resolveClientScript(`sync-client.${ext}`), SCRIPT_MIME[ext]);
+            const file = this.resolveClientScript(`sync-client.${scriptMatch[1]}`);
+            if (!file) {
+                return void res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
+                    .end("Requested client script not found on host server.");
+            }
+            res.writeHead(200, { "Content-Type": MIME_TYPES["." + scriptMatch[1]] });
+            return void fs.createReadStream(file).pipe(res);
         }
 
-        // Authentication guard for API endpoints
         if (pathname.startsWith("/api/") && !this.isAuthenticated(req, parsedUrl)) {
             return this.sendJson(res, 401, { error: "Unauthorized: valid token required" });
         }
@@ -229,9 +207,7 @@ export class SyncServer extends EventEmitter {
                     this.pollWaiters.delete(waiter);
                     try {
                         this.sendJson(res, 200, { changed: false, timestamp: Date.now() });
-                    } catch {
-                        // Ignore
-                    }
+                    } catch {}
                 }, 25000)
             };
 
@@ -245,25 +221,15 @@ export class SyncServer extends EventEmitter {
 
         if (pathname.startsWith("/api/download/")) {
             const filename = decodeURIComponent(pathname.slice(14));
+            const safePath = path.resolve(this.syncDir, filename);
+            const rel = path.relative(this.syncDir, safePath);
 
-            // Path traversal protection
-            if (!filename || filename.startsWith(".") || filename.includes("..")) {
+            if (!filename || filename.startsWith(".") || filename.includes("..") || rel.startsWith("..") || path.isAbsolute(rel)) {
                 return this.sendJson(res, 400, { error: "Invalid filename" });
             }
 
-            const safePath = path.resolve(this.syncDir, filename);
-            const rel = path.relative(this.syncDir, safePath);
-            if (rel.startsWith("..") || path.isAbsolute(rel)) {
-                return this.sendJson(res, 400, { error: "Access denied" });
-            }
-
-            let stat: fs.Stats;
-            try {
-                stat = fs.statSync(safePath);
-                if (!stat.isFile()) throw new Error();
-            } catch {
-                return this.sendJson(res, 404, { error: "File not found" });
-            }
+            const stat = fs.statSync(safePath, { throwIfNoEntry: false });
+            if (!stat?.isFile()) return this.sendJson(res, 404, { error: "File not found" });
 
             const meta = this.watcher.getFileMeta(filename);
             const ext = path.extname(filename).toLowerCase();
@@ -293,31 +259,18 @@ export class SyncServer extends EventEmitter {
             res.write(":" + " ".repeat(2048) + "\n\n");
             this.activeClients.add(res);
 
-            if (this.verbose) console.log(`[HOST] Client connected to live sync stream. Total active: ${this.activeClients.size}`);
+            const verbose = this.options.verbose ?? true;
+            if (verbose) console.log(`[HOST] Client connected to live sync stream. Total active: ${this.activeClients.size}`);
 
-            const initEvent = JSON.stringify({
-                type: "init",
-                timestamp: Date.now(),
-                manifest: this.watcher.getManifest()
-            });
-            res.write(`event: init\ndata: ${initEvent}\n\n`);
+            res.write(`event: init\ndata: ${JSON.stringify({ type: "init", timestamp: Date.now(), manifest: this.watcher.getManifest() })}\n\n`);
 
             req.on("close", () => {
                 this.activeClients.delete(res);
-                if (this.verbose) console.log(`[HOST] Client disconnected. Remaining: ${this.activeClients.size}`);
+                if (verbose) console.log(`[HOST] Client disconnected. Remaining: ${this.activeClients.size}`);
             });
             return;
         }
 
         this.sendJson(res, 404, { error: "Not Found" });
-    }
-
-    private serveFileOrFallback(res: http.ServerResponse, filePath: string | null, contentType: string): void {
-        if (!filePath) {
-            return void res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-                .end("Requested client script not found on host server.");
-        }
-        res.writeHead(200, { "Content-Type": contentType });
-        fs.createReadStream(filePath).pipe(res);
     }
 }

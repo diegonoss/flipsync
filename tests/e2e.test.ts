@@ -94,6 +94,12 @@ export async function testEndToEnd(): Promise<void> {
         await (reconnectClient as any).connectSse(35000);
         assert.match(reconnectLimitError?.message || "", /retry timer .* exceeded limit/);
         assert.equal((reconnectClient as any).isRunning, false);
+
+        // 8. Verify SyncClient rejects path traversal in downloadIfChanged
+        await assert.rejects(
+            () => client.downloadIfChanged({ name: "../escaped.txt", sha256: "dummy", size: 0, mtimeMs: 0 }),
+            { message: /Path traversal blocked/ }
+        );
     } finally {
         client.stop();
         await server.stop();

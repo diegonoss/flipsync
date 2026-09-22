@@ -127,6 +127,15 @@ export async function downloadCloudflaredBinary(): Promise<string> {
 }
 
 export async function startAutoTunnel(localPort: number): Promise<TunnelResult> {
-    const bin = findCloudflaredBinary() || (await downloadCloudflaredBinary());
+    const bin = findCloudflaredBinary();
+    if (!bin) {
+        throw new Error(
+            "cloudflared binary not found. To use Cloudflare Tunnels safely, please install cloudflared via your package manager:\n" +
+            "  - macOS: brew install cloudflared\n" +
+            "  - Windows: winget install Cloudflare.cloudflared\n" +
+            "  - Linux: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n" +
+            "Or place a verified cloudflared binary in your PATH."
+        );
+    }
     return startCloudflareTunnel(localPort, bin);
 }

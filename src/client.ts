@@ -80,7 +80,11 @@ export class SyncClient {
     }
 
     public async downloadIfChanged(file: SyncFileMeta): Promise<boolean> {
-        const destPath = path.join(this.targetDir, file.name);
+        const destPath = path.resolve(this.targetDir, file.name);
+        const rel = path.relative(this.targetDir, destPath);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            throw new Error(`Path traversal blocked for file: ${file.name}`);
+        }
         const destDir = path.dirname(destPath);
         fs.mkdirSync(destDir, { recursive: true });
 
@@ -199,9 +203,13 @@ export class SyncClient {
                     this.options.onError?.(error);
                 });
             } else if (eventType === "file_deleted" && parsed.filename) {
-                try { fs.unlinkSync(path.join(this.targetDir, parsed.filename)); } catch {}
-                if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
-                this.options.onDelete?.(parsed.filename);
+                const destPath = path.resolve(this.targetDir, parsed.filename);
+                const rel = path.relative(this.targetDir, destPath);
+                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+                    try { fs.unlinkSync(destPath); } catch {}
+                    if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
+                    this.options.onDelete?.(parsed.filename);
+                }
             }
         } catch {}
     }
