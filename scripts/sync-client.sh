@@ -46,6 +46,18 @@ else
 fi
 echo "================================================================"
 
+url_encode() {
+    local str="$1"
+    if command -v node >/dev/null 2>&1; then
+        node -e 'console.log(process.argv[1].split("/").map(encodeURIComponent).join("/"))' "$str" 2>/dev/null && return
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys, urllib.parse; print("/".join(urllib.parse.quote(p) for p in sys.argv[1].split("/")), end="")' "$str" 2>/dev/null && return
+    fi
+    # Posix fallback
+    echo "$str"
+}
+
 calc_sha256() {
     local f="$1"
     command -v sha256sum >/dev/null 2>&1 && sha256sum "$f" | awk '{print $1}' && return
@@ -88,7 +100,7 @@ sync_file() {
     fi
 
     local enc_name tmp="$parent_dir/.$(basename "$name").tmp.$$"
-    enc_name="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$name" 2>/dev/null || echo "$name")"
+    enc_name="$(url_encode "$name")"
 
     if ! curl_fetch "$SERVER/api/download/$enc_name$TOKEN_QUERY" "$tmp" "downloading $name"; then
         rm -f "$tmp"

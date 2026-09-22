@@ -16,6 +16,9 @@ export async function testEndToEnd(): Promise<void> {
     fs.writeFileSync(path.join(hostDir, "initial.txt"), "version 1");
     fs.mkdirSync(path.join(hostDir, "nested"), { recursive: true });
     fs.writeFileSync(path.join(hostDir, "nested/config.json"), '{"v":1}');
+    fs.writeFileSync(path.join(hostDir, "La_ecuación_de_Samuel.mp3"), "audio track");
+    fs.mkdirSync(path.join(hostDir, "Parking.in.Tight.Spaces.v1.49/StreamingAssets/APVStreamingAssets"), { recursive: true });
+    fs.writeFileSync(path.join(hostDir, "Parking.in.Tight.Spaces.v1.49/StreamingAssets/APVStreamingAssets/data.bytes"), "game asset");
 
     const server = new SyncServer({
         port: 0,
@@ -26,6 +29,7 @@ export async function testEndToEnd(): Promise<void> {
     });
 
     const { localUrl } = await server.start();
+    await server.getWatcher().initScan();
     const syncedFiles: string[] = [];
     const deletedFiles: string[] = [];
 
@@ -46,7 +50,10 @@ export async function testEndToEnd(): Promise<void> {
         assert.equal(fs.readFileSync(path.join(clientDir, "initial.txt"), "utf8"), "version 1");
         assert.ok(fs.existsSync(path.join(clientDir, "nested/config.json")));
         assert.equal(fs.readFileSync(path.join(clientDir, "nested/config.json"), "utf8"), '{"v":1}');
-        assert.equal(syncedFiles.length, 2);
+        assert.ok(fs.existsSync(path.join(clientDir, "La_ecuación_de_Samuel.mp3")));
+        assert.equal(fs.readFileSync(path.join(clientDir, "La_ecuación_de_Samuel.mp3"), "utf8"), "audio track");
+        assert.ok(fs.existsSync(path.join(clientDir, "Parking.in.Tight.Spaces.v1.49/StreamingAssets/APVStreamingAssets/data.bytes")));
+        assert.equal(syncedFiles.length, 4);
 
         // 3. Simulate host modifying a file
         syncedFiles.length = 0;

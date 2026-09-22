@@ -28,6 +28,11 @@ param (
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+} catch {}
 
 if (-not $Server) {
     if (Test-Path Variable:s) { $Server = $s }
@@ -103,7 +108,7 @@ function Sync-File {
         return $false
     }
 
-    $dest = Join-Path $ResolvedTarget $FileName
+    $dest = Join-Path $ResolvedTarget ($FileName -replace '/', [System.IO.Path]::DirectorySeparatorChar)
     $parentDir = Split-Path $dest -Parent
     if (-not (Test-Path $parentDir)) {
         New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
@@ -117,10 +122,10 @@ function Sync-File {
     }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $encodedName = [System.Uri]::EscapeDataString($FileName)
-    $downloadUrl = "$Server/api/download/$encodedName$TokenQuery"
-    $tempFile = Join-Path $parentDir ".$(Split-Path $FileName -Leaf).tmp.$([System.DateTime]::UtcNow.Ticks)"
-    
+    $encodedPath = (($FileName -replace '\\', '/').Split('/') | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/'
+    $downloadUrl = "$Server/api/download/$encodedPath$TokenQuery"
+    $tempFile = Join-Path $parentDir ".$(Split-Path $dest -Leaf).tmp.$([System.DateTime]::UtcNow.Ticks)"
+
     try {
         Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile -UseBasicParsing -UserAgent "FlipSync/1.0"
         $downloadedHash = Get-FileSha256 -FilePath $tempFile
@@ -200,7 +205,7 @@ while ($true) {
         if ($res.changed) {
             if ($res.deleted) {
                 if (-not ($res.deleted -like "*..*") -and -not [System.IO.Path]::IsPathRooted($res.deleted)) {
-                    $targetFile = Join-Path $ResolvedTarget $res.deleted
+                    $targetFile = Join-Path $ResolvedTarget ($res.deleted -replace '/', [System.IO.Path]::DirectorySeparatorChar)
                     if (Test-Path $targetFile) {
                         Remove-Item $targetFile -Force -ErrorAction SilentlyContinue
                         Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] [DELETE] Removed $($res.deleted) (deleted on host)" -ForegroundColor Yellow

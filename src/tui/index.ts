@@ -139,13 +139,19 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         logBox.add(`{gray-fg}[${time}]{/} {${color}-fg}[${tag}]{/} ${message}`);
     };
 
+    const getIndexingPct = (idx?: { completed: number; total: number }) =>
+        idx && idx.total > 0 ? Math.round((idx.completed / idx.total) * 100) : 0;
+
     const renderHeader = () => {
         const state = engine.getState();
         const role = state.role.toUpperCase();
+        const indexingPct = getIndexingPct(state.indexing);
 
         let statusBadge = "{green-bg}{black-fg}{bold} ACTIVE {/}";
         if (state.isPaused) {
             statusBadge = "{yellow-bg}{black-fg}{bold} PAUSED {/}";
+        } else if (state.indexing?.isIndexing) {
+            statusBadge = `{cyan-bg}{black-fg}{bold} INDEXING (${indexingPct}%) {/}`;
         } else if (state.status === "syncing") {
             statusBadge = "{cyan-bg}{black-fg}{bold} SYNCING {/}";
         } else if (state.status === "error") {
@@ -161,10 +167,14 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             tunnelDisplay = "{red-fg}✕ Error{/}";
         }
 
+        const indexingText = state.indexing?.isIndexing
+            ? ` {yellow-fg}(Indexing: ${state.indexing.completed}/${state.indexing.total} - ${indexingPct}%){/}`
+            : "";
+
         const lines = [
             `{bold}FlipSync{/} {cyan-fg}${role}{/}  |  Status: ${statusBadge}  |  Tunnel: ${tunnelDisplay}`,
             `{bold}Endpoints:{/} Local: {underline}${state.endpoints.local || "N/A"}{/}  |  LAN: {underline}${state.endpoints.lan || "N/A"}{/}  |  Tailscale: ${state.endpoints.tailscale || "N/A"}`,
-            `{bold}Directory:{/} {underline}${state.syncDir}{/}  |  {bold}Files:{/} ${state.stats.totalFiles}  |  {bold}Auth Token:{/} ${state.token ? state.token : "{gray-fg}(Open Access){/}"}`
+            `{bold}Directory:{/} {underline}${state.syncDir}{/}  |  {bold}Files:{/} ${state.stats.totalFiles}${indexingText}  |  {bold}Auth Token:{/} ${state.token ? state.token : "{gray-fg}(Open Access){/}"}`
         ];
 
         if (state.serverUrl) {
@@ -179,6 +189,26 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         const active = state.activeTransfers.filter((t) => t.percent < 100);
 
         if (active.length === 0) {
+            if (state.indexing?.isIndexing) {
+                const pct = getIndexingPct(state.indexing);
+                const bar = renderProgressBar(pct, 26);
+                const fileDetail = state.indexing.currentFile
+                    ? `  • Current File:       {bold}${state.indexing.currentFile}{/}`
+                    : "";
+                const lines = [
+                    `{cyan-fg}{bold}Indexing files: ${state.indexing.completed}/${state.indexing.total} (${pct}%){/}`,
+                    `  ${bar}`,
+                    fileDetail,
+                    "",
+                    `{bold}Stats Summary:{/}`,
+                    `  • Discovered Files:   {bold}${state.stats.totalFiles}{/}`,
+                    `  • Synced Files:       {bold}${state.stats.syncedFiles}{/}`,
+                    `  • Errors Encountered: ${state.stats.errorsCount > 0 ? `{red-fg}{bold}${state.stats.errorsCount}{/}` : "0"}`
+                ].filter(Boolean);
+                transferBox.setContent(lines.join("\n"));
+                return;
+            }
+
             const lines = [
                 `{gray-fg}Engine idle - All queues empty and up to date.{/}`,
                 "",
@@ -212,7 +242,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     const renderFooter = () => {
         const state = engine.getState();
-        const statusText = state.isPaused ? "PAUSED (press p to resume)" : state.status.toUpperCase();
+        let statusText = state.isPaused ? "PAUSED (press p to resume)" : state.status.toUpperCase();
+        if (!state.isPaused && state.indexing?.isIndexing) {
+            const pct = getIndexingPct(state.indexing);
+            statusText = `INDEXING ${state.indexing.completed}/${state.indexing.total} (${pct}%)`;
+        }
         footerBox.setContent(
             ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[x]{/} Cancel  {bold}[r]{/} Re-sync  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
         );
@@ -241,6 +275,20 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     };
 
     // Wire up SyncEngine events to TUI
+    engine.on("scan:discovered", (event: { totalFiles: number }) => {
+        addLog("INDEX", `Discovered ${event.totalFiles} file(s). Progressively indexing in background...`, "cyan");
+        scheduleRender();
+    });
+
+    engine.on("scan:progress", () => {
+        scheduleRender();
+    });
+
+    engine.on("scan:complete", (event: { totalFiles: number }) => {
+        addLog("INDEX", `Indexing complete. All ${event.totalFiles} file(s) indexed and verified.`, "green");
+        scheduleRender();
+    });
+
     engine.on("engine:ready", (event: SyncEngineReadyEvent) => {
         addLog("READY", `Engine initialized. Watching ${event.filesCount} file(s) in ${event.syncDir}`, "green");
         if (event.tunnelUrl) {

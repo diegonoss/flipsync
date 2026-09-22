@@ -61,7 +61,16 @@ export class DirectoryWatcher extends EventEmitter {
                 return this.getManifest();
             }
 
-            const scan = async (dir: string, prefix = ""): Promise<void> => {
+            // Phase 1 (Discovery): Fast traversal to collect entries without hashing
+            interface DiscoveredEntry {
+                relPath: string;
+                fullPath: string;
+                cachedMeta?: SyncFileMeta;
+            }
+
+            const discovered: DiscoveredEntry[] = [];
+
+            const discover = async (dir: string, prefix = ""): Promise<void> => {
                 if (this.isClosed || signal.aborted) return;
                 let entries: fs.Dirent[];
                 try {
@@ -77,26 +86,61 @@ export class DirectoryWatcher extends EventEmitter {
                     const fullPath = path.join(dir, entry.name);
 
                     if (entry.isDirectory()) {
-                        await scan(fullPath, relPath);
+                        await discover(fullPath, relPath);
                     } else if (entry.isFile()) {
-                        const existing = this.cache.get(relPath);
-                        if (existing) {
-                            const stat = await fs.promises.stat(fullPath).catch(() => null);
-                            if (stat && existing.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1) {
-                                continue;
-                            }
+                        try {
+                            const stat = await fs.promises.stat(fullPath);
+                            const existing = this.cache.get(relPath);
+                            const cachedMeta = existing && existing.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1 ? existing : undefined;
+                            discovered.push({ relPath, fullPath, cachedMeta });
+                        } catch {
+                            // Ignore stat errors for inaccessible / transient files
                         }
-
-                        const meta = await computeFileHash(fullPath, 5, 40, signal);
-                        if (meta && !this.isClosed) {
-                            this.cache.set(relPath, { name: relPath, ...meta });
-                        }
-                        await setImmediate();
                     }
                 }
             };
 
-            await scan(this.syncDir);
+            await discover(this.syncDir);
+            if (this.isClosed || signal.aborted) return this.getManifest();
+
+            const total = discovered.length;
+            this.emit("scan:discovered", { totalFiles: total });
+
+            // Phase 2 (Progressive Hashing & Immediate Sync): Compute SHA-256 file by file and yield
+            const discoveredSet = new Set<string>();
+            let completed = 0;
+
+            for (const item of discovered) {
+                if (this.isClosed || signal.aborted) break;
+                discoveredSet.add(item.relPath);
+
+                if (!item.cachedMeta) {
+                    const meta = await computeFileHash(item.fullPath, 5, 40, signal);
+                    if (meta && !this.isClosed && !signal.aborted) {
+                        const fileMeta: SyncFileMeta = { name: item.relPath, ...meta };
+                        const prev = this.cache.get(item.relPath);
+                        this.cache.set(item.relPath, fileMeta);
+                        if (!prev || prev.sha256 !== fileMeta.sha256) {
+                            this.emit("change", fileMeta);
+                        }
+                    }
+                    await setImmediate();
+                }
+
+                completed++;
+                this.emit("scan:progress", { completed, total, file: item.relPath });
+            }
+
+            if (!signal.aborted && !this.isClosed) {
+                for (const key of this.cache.keys()) {
+                    if (!discoveredSet.has(key)) {
+                        this.cache.delete(key);
+                        this.emit("delete", key);
+                    }
+                }
+            }
+
+            this.emit("scan:complete", { totalFiles: this.cache.size });
             return this.getManifest();
         })().finally(() => {
             this.scanAbortController = null;

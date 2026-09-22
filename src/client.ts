@@ -91,7 +91,8 @@ export class SyncClient {
         if (await verifyFileHash(destPath, file.sha256)) return false;
 
         const startMs = Date.now();
-        const res = await fetch(this.url(`/api/download/${encodeURIComponent(file.name)}`));
+        const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
+        const res = await fetch(this.url(`/api/download/${encodedName}`));
         if (res.status === 401 || res.status === 403) {
             throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
         }
@@ -103,6 +104,7 @@ export class SyncClient {
             throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
         }
 
+        fs.mkdirSync(destDir, { recursive: true });
         const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
         fs.writeFileSync(tempPath, buffer);
         fs.renameSync(tempPath, destPath);
@@ -196,12 +198,18 @@ export class SyncClient {
 
         try {
             const parsed = JSON.parse(data) as SyncEvent;
-            if (eventType === "file_changed" && parsed.file) {
-                this.downloadIfChanged(parsed.file).catch((err: unknown) => {
+            const syncFile = (f: SyncFileMeta) => {
+                this.downloadIfChanged(f).catch((err: unknown) => {
                     const error = err instanceof Error ? err : new Error(String(err));
-                    if (this.verbose) console.error(`[CLIENT] Error updating ${parsed.file?.name}: ${error.message}`);
+                    if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
                     this.options.onError?.(error);
                 });
+            };
+
+            if (eventType === "init" && parsed.manifest?.files) {
+                for (const file of Object.values(parsed.manifest.files)) syncFile(file);
+            } else if (eventType === "file_changed" && parsed.file) {
+                syncFile(parsed.file);
             } else if (eventType === "file_deleted" && parsed.filename) {
                 const destPath = path.resolve(this.targetDir, parsed.filename);
                 const rel = path.relative(this.targetDir, destPath);

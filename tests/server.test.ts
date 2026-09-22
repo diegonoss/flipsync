@@ -36,12 +36,23 @@ export async function testServer(): Promise<void> {
         });
         assert.equal(badTokenRes.status, 401);
 
-        // 3. Valid Bearer token -> 200
+        // 3. Valid Bearer token -> 200 (immediate non-blocking manifest with indexing status)
         const authRes = await fetch(`${localUrl}/api/manifest`, {
             headers: { Authorization: `Bearer ${token}` }
         });
         assert.equal(authRes.status, 200);
-        const manifest = (await authRes.json()) as { files: Record<string, { size: number }> };
+        assert.ok(authRes.headers.has("x-is-indexing"));
+
+        // Wait for background scan to finish
+        await server.getWatcher().initScan();
+
+        const completedRes = await fetch(`${localUrl}/api/manifest`, {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+        assert.equal(completedRes.status, 200);
+        assert.equal(completedRes.headers.get("x-is-indexing"), "false");
+        const manifest = (await completedRes.json()) as { files: Record<string, { size: number }>; is_indexing: boolean };
+        assert.equal(manifest.is_indexing, false);
         assert.ok(manifest.files["test.txt"]);
         assert.ok(manifest.files["sub/deep.txt"]);
 
@@ -68,6 +79,24 @@ export async function testServer(): Promise<void> {
         assert.equal(dlNestedRes.status, 200);
         const dlNestedText = await dlNestedRes.text();
         assert.equal(dlNestedText, "deep contents");
+
+        // 7b. Download file with accents / special characters (UTF-8 encoding test)
+        const accentFile = "La_ecuación_de_Samuel.mp3";
+        fs.writeFileSync(path.join(tempDir, accentFile), "audio-content-sample");
+        await server.getWatcher().initScan();
+        const dlAccentRes = await fetch(`${localUrl}/api/download/${encodeURIComponent(accentFile)}?token=${token}`);
+        assert.equal(dlAccentRes.status, 200);
+        assert.equal(await dlAccentRes.text(), "audio-content-sample");
+
+        // 7c. Deeply nested subfolder download test
+        const deepRel = "Parking.in.Tight.Spaces.v1.49/StreamingAssets/APVStreamingAssets/data.bytes";
+        fs.mkdirSync(path.join(tempDir, path.dirname(deepRel)), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, deepRel), "game-bytes-sample");
+        await server.getWatcher().initScan();
+        const encDeep = deepRel.split("/").map(encodeURIComponent).join("/");
+        const dlDeepRes = await fetch(`${localUrl}/api/download/${encDeep}?token=${token}`);
+        assert.equal(dlDeepRes.status, 200);
+        assert.equal(await dlDeepRes.text(), "game-bytes-sample");
 
         // 8. Path traversal attempt: ../ -> 400
         const traversalRes1 = await fetch(`${localUrl}/api/download/..%2Fpackage.json?token=${token}`);

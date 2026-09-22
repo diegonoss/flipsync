@@ -14,6 +14,9 @@ export async function testStandaloneClients(): Promise<void> {
     const token = "standalone-token-789";
 
     fs.writeFileSync(path.join(hostDir, "data.json"), JSON.stringify({ message: "hello standalone" }));
+    fs.writeFileSync(path.join(hostDir, "La_ecuación_de_Samuel.mp3"), "accent-data");
+    fs.mkdirSync(path.join(hostDir, "sub/deep"), { recursive: true });
+    fs.writeFileSync(path.join(hostDir, "sub/deep/file.txt"), "nested-data");
 
     const server = new SyncServer({
         port: 0,
@@ -24,6 +27,7 @@ export async function testStandaloneClients(): Promise<void> {
     });
 
     const { localUrl } = await server.start();
+    await server.getWatcher().initScan();
 
     try {
         // 1. Standalone sync-client.js
@@ -44,6 +48,10 @@ export async function testStandaloneClients(): Promise<void> {
         assert.ok(fs.existsSync(path.join(clientDirJs, "data.json")));
         const jsData = JSON.parse(fs.readFileSync(path.join(clientDirJs, "data.json"), "utf8"));
         assert.equal(jsData.message, "hello standalone");
+        assert.ok(fs.existsSync(path.join(clientDirJs, "La_ecuación_de_Samuel.mp3")));
+        assert.equal(fs.readFileSync(path.join(clientDirJs, "La_ecuación_de_Samuel.mp3"), "utf8"), "accent-data");
+        assert.ok(fs.existsSync(path.join(clientDirJs, "sub/deep/file.txt")));
+        assert.equal(fs.readFileSync(path.join(clientDirJs, "sub/deep/file.txt"), "utf8"), "nested-data");
 
         // 2. Standalone sync-client.sh (if bash is available)
         if (process.platform !== "win32") {
@@ -64,6 +72,10 @@ export async function testStandaloneClients(): Promise<void> {
             assert.ok(fs.existsSync(path.join(clientDirBash, "data.json")));
             const bashData = JSON.parse(fs.readFileSync(path.join(clientDirBash, "data.json"), "utf8"));
             assert.equal(bashData.message, "hello standalone");
+            assert.ok(fs.existsSync(path.join(clientDirBash, "La_ecuación_de_Samuel.mp3")));
+            assert.equal(fs.readFileSync(path.join(clientDirBash, "La_ecuación_de_Samuel.mp3"), "utf8"), "accent-data");
+            assert.ok(fs.existsSync(path.join(clientDirBash, "sub/deep/file.txt")));
+            assert.equal(fs.readFileSync(path.join(clientDirBash, "sub/deep/file.txt"), "utf8"), "nested-data");
         }
         // 3. Verify standalone clients terminate immediately on 401 when token is missing
         const expectAuthFailure = (cmd: string) =>

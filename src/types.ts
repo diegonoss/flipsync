@@ -11,6 +11,7 @@ export interface SyncManifest {
     serverTime: number;
     syncPath: string;
     files: Record<string, SyncFileMeta>;
+    is_indexing?: boolean;
 }
 
 export type SyncEventType = "init" | "file_changed" | "file_deleted" | "ping";
@@ -21,6 +22,7 @@ export interface SyncEvent {
     file?: SyncFileMeta;
     filename?: string;
     manifest?: SyncManifest;
+    is_indexing?: boolean;
 }
 
 export interface ServerOptions {

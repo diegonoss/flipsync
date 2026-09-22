@@ -103,7 +103,8 @@ class Client {
         }
 
         const start = Date.now();
-        const buf = await this.httpDownload(this.url(`/api/download/${encodeURIComponent(file.name)}`));
+        const encName = file.name.split("/").map(encodeURIComponent).join("/");
+        const buf = await this.httpDownload(this.url(`/api/download/${encName}`));
 
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
@@ -111,6 +112,7 @@ class Client {
         }
 
         // Atomic write
+        fs.mkdirSync(parentDir, { recursive: true });
         const tmp = path.join(parentDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
         fs.writeFileSync(tmp, buf);
         fs.renameSync(tmp, dest);
@@ -207,10 +209,13 @@ class Client {
 
         try {
             const parsed = JSON.parse(data);
-            if (event === "file_changed" && parsed.file) {
-                this.downloadIfChanged(parsed.file).catch((e) =>
-                    console.error(`[CLIENT] [ERROR] Failed update: ${e.message}`)
-                );
+            const syncFile = (f) => this.downloadIfChanged(f).catch((e) =>
+                console.error(`[CLIENT] [ERROR] Failed update: ${e.message}`)
+            );
+            if (event === "init" && parsed.manifest?.files) {
+                Object.values(parsed.manifest.files).forEach(syncFile);
+            } else if (event === "file_changed" && parsed.file) {
+                syncFile(parsed.file);
             } else if (event === "file_deleted" && parsed.filename) {
                 const dest = path.resolve(this.target, parsed.filename);
                 const rel = path.relative(this.target, dest);

@@ -139,7 +139,7 @@ export class SyncServer extends EventEmitter {
         for (const { res, timer } of this.pollWaiters) {
             clearTimeout(timer);
             try {
-                res.writeHead(200, { "Content-Type": "application/json" }).end(json);
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" }).end(json);
             } catch {}
         }
         this.pollWaiters.clear();
@@ -166,7 +166,7 @@ export class SyncServer extends EventEmitter {
     }
 
     private sendJson(res: http.ServerResponse, status: number, data: unknown): void {
-        res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(data));
+        res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }).end(JSON.stringify(data));
     }
 
     private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -207,10 +207,13 @@ export class SyncServer extends EventEmitter {
         }
 
         if (pathname === "/api/manifest") {
-            if (this.watcher.isScanning()) {
-                await this.watcher.initScan();
-            }
-            return this.sendJson(res, 200, this.watcher.getManifest());
+            const manifest = this.watcher.getManifest();
+            const isIndexing = this.watcher.isScanning();
+            res.setHeader("X-Is-Indexing", isIndexing ? "true" : "false");
+            return this.sendJson(res, 200, {
+                ...manifest,
+                is_indexing: isIndexing
+            });
         }
 
         if (pathname === "/api/wait-change") {
@@ -242,18 +245,31 @@ export class SyncServer extends EventEmitter {
         }
 
         if (pathname.startsWith("/api/download/")) {
-            const filename = decodeURIComponent(pathname.slice(14));
+            let filename: string;
+            try {
+                filename = decodeURIComponent(pathname.slice(14));
+            } catch {
+                return this.sendJson(res, 400, { error: "Invalid URI encoding" });
+            }
+
+            filename = filename.replace(/\\/g, "/");
             const safePath = path.resolve(this.syncDir, filename);
             const rel = path.relative(this.syncDir, safePath);
 
-            if (!filename || filename.startsWith(".") || filename.includes("..") || rel.startsWith("..") || path.isAbsolute(rel)) {
+            if (
+                !filename ||
+                filename.startsWith(".") ||
+                filename.split("/").some((part) => part === ".." || part === ".") ||
+                rel.startsWith("..") ||
+                path.isAbsolute(rel)
+            ) {
                 return this.sendJson(res, 400, { error: "Invalid filename" });
             }
 
             const stat = fs.statSync(safePath, { throwIfNoEntry: false });
             if (!stat?.isFile()) return this.sendJson(res, 404, { error: "File not found" });
 
-            const meta = this.watcher.getFileMeta(filename);
+            const meta = this.watcher.getFileMeta(rel);
             const ext = path.extname(filename).toLowerCase();
             res.writeHead(200, {
                 "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
@@ -297,7 +313,7 @@ export class SyncServer extends EventEmitter {
 
         if (pathname === "/api/events") {
             res.writeHead(200, {
-                "Content-Type": "text/event-stream",
+                "Content-Type": "text/event-stream; charset=utf-8",
                 "Cache-Control": "no-cache, no-transform",
                 Connection: "keep-alive",
                 "X-Accel-Buffering": "no"
@@ -310,11 +326,14 @@ export class SyncServer extends EventEmitter {
             const verbose = this.options.verbose ?? true;
             if (verbose) console.log(`[HOST] Client connected to live sync stream. Total active: ${this.activeClients.size}`);
 
-            if (this.watcher.isScanning()) {
-                await this.watcher.initScan();
-            }
-
-            res.write(`event: init\ndata: ${JSON.stringify({ type: "init", timestamp: Date.now(), manifest: this.watcher.getManifest() })}\n\n`);
+            const manifest = this.watcher.getManifest();
+            const isIndexing = this.watcher.isScanning();
+            res.write(`event: init\ndata: ${JSON.stringify({
+                type: "init",
+                timestamp: Date.now(),
+                manifest,
+                is_indexing: isIndexing
+            })}\n\n`);
 
             req.on("close", () => {
                 this.activeClients.delete(res);

@@ -123,6 +123,12 @@ export interface SyncEngineState {
         conflictsCount: number;
         lastSyncTime: number;
     };
+    indexing?: {
+        isIndexing: boolean;
+        completed: number;
+        total: number;
+        currentFile?: string;
+    };
     activeTransfers: Array<{
         file: string;
         transferred: number;
@@ -169,6 +175,12 @@ export class SyncEngine extends EventEmitter {
 
     // Transfer tracking
     private readonly activeTransfersMap = new Map<string, ActiveTransfer>();
+    private indexingState = {
+        isIndexing: false,
+        completed: 0,
+        total: 0,
+        currentFile: undefined as string | undefined
+    };
     private readonly stats = {
         totalFiles: 0,
         syncedFiles: 0,
@@ -252,6 +264,7 @@ export class SyncEngine extends EventEmitter {
 
     public cancelTransfers(): void {
         this.watcher?.cancelScan();
+        this.indexingState.isIndexing = false;
         this.server?.abortTransfers();
         this.currentDownloadReq?.destroy();
         this.currentDownloadReq = null;
@@ -421,6 +434,7 @@ export class SyncEngine extends EventEmitter {
             tunnelState: this.tunnelState,
             token: this.token,
             serverUrl: this.serverUrl,
+            indexing: this.indexingState.isIndexing ? { ...this.indexingState } : undefined,
             stats: {
                 ...this.stats,
                 activeTransfers: this.activeTransfersMap.size
@@ -577,6 +591,34 @@ export class SyncEngine extends EventEmitter {
             this.emit("sync:error", { error: err, context: "watcher" });
         });
 
+        this.watcher.on("scan:discovered", ({ totalFiles }: { totalFiles: number }) => {
+            this.stats.totalFiles = totalFiles;
+            this.indexingState = {
+                isIndexing: true,
+                completed: 0,
+                total: totalFiles,
+                currentFile: undefined
+            };
+            this.emit("scan:discovered", { totalFiles });
+        });
+
+        this.watcher.on("scan:progress", (data: { completed: number; total: number; file: string }) => {
+            const percent = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 100;
+            this.indexingState = {
+                isIndexing: true,
+                completed: data.completed,
+                total: data.total,
+                currentFile: data.file
+            };
+            this.emit("scan:progress", { ...data, percent });
+        });
+
+        this.watcher.on("scan:complete", ({ totalFiles }: { totalFiles: number }) => {
+            this.stats.totalFiles = totalFiles;
+            this.indexingState.isIndexing = false;
+            this.emit("scan:complete", { totalFiles });
+        });
+
         await this.watcher.startWatching();
 
         // 1. Start HTTP & SSE Server immediately
@@ -697,9 +739,13 @@ export class SyncEngine extends EventEmitter {
             for (const file of files) {
                 this.syncedHashes.set(file.name, file.sha256);
             }
-            this.status = "idle";
-            this.emit("sync:idle");
+            this.indexingState.isIndexing = false;
+            if (this.activeTransfersMap.size === 0) {
+                this.status = "idle";
+                this.emit("sync:idle");
+            }
         }).catch((err: unknown) => {
+            this.indexingState.isIndexing = false;
             this.stats.errorsCount++;
             this.emit("sync:error", { error: err instanceof Error ? err : new Error(String(err)), context: "watcher:initScan" });
         });

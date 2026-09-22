@@ -16,7 +16,25 @@ export async function testWatcher(): Promise<void> {
         fs.mkdirSync(path.join(tempDir, "sub"), { recursive: true });
         fs.writeFileSync(path.join(tempDir, "sub/nested.txt"), "hello nested");
 
+        let discoveredTotal = 0;
+        const progressList: Array<{ completed: number; total: number; file: string }> = [];
+        let completedTotal = 0;
+
+        watcher.on("scan:discovered", (e: { totalFiles: number }) => {
+            discoveredTotal = e.totalFiles;
+        });
+        watcher.on("scan:progress", (e: { completed: number; total: number; file: string }) => {
+            progressList.push(e);
+        });
+        watcher.on("scan:complete", (e: { totalFiles: number }) => {
+            completedTotal = e.totalFiles;
+        });
+
         const manifest = await watcher.initScan();
+        assert.equal(discoveredTotal, 2, "scan:discovered should report 2 files discovered in Phase 1");
+        assert.equal(completedTotal, 2, "scan:complete should report 2 files completed in Phase 2");
+        assert.equal(progressList.length, 2, "scan:progress should emit for each file");
+        assert.equal(progressList[1].completed, 2);
         assert.ok(manifest.files["fileA.txt"]);
         assert.ok(manifest.files["sub/nested.txt"]);
         assert.equal(manifest.files["fileA.txt"].size, 12);
