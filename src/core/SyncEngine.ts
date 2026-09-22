@@ -573,12 +573,46 @@ export class SyncEngine extends EventEmitter {
             watcher: this.watcher
         });
 
-        this.server.on("file_served", (event: { file: string; size: number; clientIp: string }) => {
+        const updateTransfer = (id: string, file: string, transferred: number, total: number) => {
+            let t = this.activeTransfersMap.get(id);
+            if (!t) {
+                t = { file, transferred: 0, total, percent: 0, speedBps: 0, startTime: Date.now(), lastUpdateTime: Date.now(), lastTransferred: 0 };
+                this.activeTransfersMap.set(id, t);
+                this.status = "syncing";
+                this.emit("sync:start", { count: 1, files: [file] });
+            }
+            t.transferred = transferred;
+            t.total = total;
+            const now = Date.now();
+            const timeDiff = (now - t.lastUpdateTime) / 1000;
+            if (timeDiff >= 0.1 || transferred >= total) {
+                t.speedBps = timeDiff > 0 ? (transferred - t.lastTransferred) / timeDiff : 0;
+                t.percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
+                t.lastUpdateTime = now;
+                t.lastTransferred = transferred;
+                this.emit("sync:file-progress", { file, transferred, total, percent: t.percent });
+            }
+        };
+
+        const finishTransfer = (id?: string) => {
+            if (id) this.activeTransfersMap.delete(id);
+            if (this.activeTransfersMap.size === 0) {
+                this.status = "idle";
+                this.emit("sync:idle");
+            }
+        };
+
+        this.server.on("file_start", (e: { id: string; file: string; size: number }) => updateTransfer(e.id, e.file, 0, e.size));
+        this.server.on("file_progress", (e: { id: string; file: string; transferred: number; total: number }) => updateTransfer(e.id, e.file, e.transferred, e.total));
+        this.server.on("file_served", (e: { id?: string; file: string; size: number; clientIp: string }) => {
             this.stats.syncedFiles++;
-            this.stats.bytesTransferred += event.size;
+            this.stats.bytesTransferred += e.size;
             this.stats.lastSyncTime = Date.now();
-            this.emit("sync:file-served", event);
+            this.emit("sync:file-progress", { file: e.file, transferred: e.size, total: e.size, percent: 100 });
+            this.emit("sync:file-served", { file: e.file, size: e.size, clientIp: e.clientIp });
+            finishTransfer(e.id);
         });
+        this.server.on("file_aborted", (e: { id: string }) => finishTransfer(e.id));
 
         try {
             const info = await this.server.start();
@@ -660,19 +694,15 @@ export class SyncEngine extends EventEmitter {
         this.stats.lastSyncTime = Date.now();
 
         this.emit("sync:start", { count: 1, files: [file.name] });
-        this.emit("sync:file-progress", {
-            file: file.name,
-            transferred: file.size,
-            total: file.size,
-            percent: 100
-        });
         this.emit("sync:file-complete", {
             file: file.name,
             hash: file.sha256
         });
 
-        this.status = "idle";
-        this.emit("sync:idle");
+        if (this.activeTransfersMap.size === 0) {
+            this.status = "idle";
+            this.emit("sync:idle");
+        }
     }
 
     // =========================================================================

@@ -35,6 +35,8 @@ export async function testSyncEngine(): Promise<void> {
 
     let hostReadyEvent: SyncEngineReadyEvent | null = null;
     let hostCompletedFiles: string[] = [];
+    const hostProgressEvents: SyncFileProgressEvent[] = [];
+    const hostServedEvents: any[] = [];
     let hostIdleCount = 0;
 
     hostEngine.on("engine:ready", (e: SyncEngineReadyEvent) => {
@@ -43,6 +45,14 @@ export async function testSyncEngine(): Promise<void> {
 
     hostEngine.on("sync:file-complete", (e: SyncFileCompleteEvent) => {
         hostCompletedFiles.push(e.file);
+    });
+
+    hostEngine.on("sync:file-progress", (e: SyncFileProgressEvent) => {
+        hostProgressEvents.push(e);
+    });
+
+    hostEngine.on("sync:file-served", (e: any) => {
+        hostServedEvents.push(e);
     });
 
     hostEngine.on("sync:idle", () => {
@@ -193,6 +203,8 @@ export async function testSyncEngine(): Promise<void> {
             // Test streaming transfer of a multi-chunk file
             progressEvents.length = 0;
             clientCompleted.length = 0;
+            hostProgressEvents.length = 0;
+            hostServedEvents.length = 0;
             const largeData = Buffer.alloc(256 * 1024, "f");
             fs.writeFileSync(path.join(hostDir, "stream-large.bin"), largeData);
 
@@ -200,6 +212,11 @@ export async function testSyncEngine(): Promise<void> {
             assert.ok(fs.existsSync(path.join(clientDir, "stream-large.bin")), "stream-large.bin should sync to client");
             assert.equal(fs.readFileSync(path.join(clientDir, "stream-large.bin")).length, largeData.length);
             assert.ok(clientCompleted.some((c) => c.file === "stream-large.bin"), "stream-large.bin should emit completion");
+            assert.ok(hostProgressEvents.some((c) => c.file === "stream-large.bin"), "host should emit sync:file-progress for sent data");
+            assert.ok(hostServedEvents.some((c) => c.file === "stream-large.bin"), "host should emit sync:file-served when send completes");
+            const lastHostProgress = hostProgressEvents.filter((c) => c.file === "stream-large.bin").pop();
+            assert.equal(lastHostProgress?.percent, 100);
+            assert.equal(lastHostProgress?.transferred, largeData.length);
             // Verify no leftover .tmp files
             const clientFiles = fs.readdirSync(clientDir);
             assert.ok(!clientFiles.some((f) => f.includes(".tmp.")), "No temporary files should remain");

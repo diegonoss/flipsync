@@ -25,6 +25,7 @@ export type {
     SyncErrorEvent,
     SyncStartEvent,
     SyncEngineReadyEvent,
+    SyncFileServedEvent,
     ActiveTransfer,
     SyncEngineState
 } from "./core/SyncEngine.js";

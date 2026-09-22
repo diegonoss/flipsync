@@ -4,6 +4,7 @@ import type {
     SyncStartEvent,
     SyncFileProgressEvent,
     SyncFileCompleteEvent,
+    SyncFileServedEvent,
     SyncConflictEvent,
     SyncErrorEvent
 } from "../core/SyncEngine.js";
@@ -134,6 +135,21 @@ export async function runHeadlessCli(
             }));
         } else {
             logOut(`[COMPLETE] ${event.file} (sha256: ${event.hash.slice(0, 10)}...)`);
+        }
+    });
+
+    engine.on("sync:file-served", (event: SyncFileServedEvent) => {
+        if (format === "json") {
+            logOut(JSON.stringify({
+                timestamp: timestamp(),
+                event: "sync:file-served",
+                file: event.file,
+                size: event.size,
+                clientIp: event.clientIp
+            }));
+        } else if (!quiet) {
+            const kb = (event.size / 1024).toFixed(1);
+            logOut(`[SERVED] Sent ${event.file} (${kb} KB) to ${event.clientIp}`);
         }
     });
 

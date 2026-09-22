@@ -26,6 +26,7 @@ export class SyncServer extends EventEmitter {
     private pollWaiters = new Set<{ res: http.ServerResponse; timer: NodeJS.Timeout }>();
     private lastChangeTime = Date.now();
     private keepaliveTimer: NodeJS.Timeout | null = null;
+    private transferCounter = 0;
 
     constructor(private options: ServerOptions) {
         super();
@@ -243,10 +244,38 @@ export class SyncServer extends EventEmitter {
                 ...(meta ? { ETag: `"${meta.sha256}"`, "X-File-SHA256": meta.sha256 } : {})
             });
 
-            fs.createReadStream(safePath).pipe(res);
+            if (req.method === "HEAD") {
+                return void res.end();
+            }
 
             const clientIp = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "client";
-            this.emit("file_served", { file: filename, size: stat.size, clientIp });
+            const transferId = `${clientIp}:${filename}:${++this.transferCounter}`;
+            this.emit("file_start", { id: transferId, file: filename, size: stat.size, clientIp });
+
+            let transferred = 0;
+            let lastTime = 0;
+            const stream = fs.createReadStream(safePath);
+
+            stream.on("data", (chunk: Buffer | string) => {
+                transferred += chunk.length;
+                const now = Date.now();
+                if (now - lastTime >= 100 || transferred >= stat.size) {
+                    lastTime = now;
+                    this.emit("file_progress", { id: transferId, file: filename, transferred, total: stat.size, clientIp });
+                }
+            });
+            stream.on("error", () => res.destroy());
+
+            res.on("finish", () => {
+                this.emit("file_served", { id: transferId, file: filename, size: stat.size, clientIp });
+            });
+            res.on("close", () => {
+                if (!res.writableEnded) {
+                    this.emit("file_aborted", { id: transferId, file: filename, clientIp });
+                }
+            });
+
+            stream.pipe(res);
             return;
         }
 

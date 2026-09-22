@@ -9,6 +9,7 @@ export type {
     SyncErrorEvent,
     SyncStartEvent,
     SyncEngineReadyEvent,
+    SyncFileServedEvent,
     ActiveTransfer,
     SyncEngineState
 } from "./SyncEngine.js";
