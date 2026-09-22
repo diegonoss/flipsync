@@ -55,8 +55,9 @@ export async function testSyncEngine(): Promise<void> {
         // Verify host initialization
         assert.ok(hostReadyEvent, "Host should emit engine:ready");
         assert.equal((hostReadyEvent as SyncEngineReadyEvent).role, "host");
-        assert.equal((hostReadyEvent as SyncEngineReadyEvent).filesCount, 2);
         assert.ok((hostReadyEvent as SyncEngineReadyEvent).localUrl?.startsWith("http://localhost:"));
+
+        await hostEngine.waitForInitialScan();
         assert.ok(hostIdleCount >= 1, "Host should emit sync:idle after ready");
 
         const hostState = hostEngine.getState();

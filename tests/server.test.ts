@@ -149,6 +149,32 @@ export async function testServer(): Promise<void> {
                 fs.rmSync(externalDir, { recursive: true, force: true });
             }
         }
+
+        // 8. Test decoupled startup: HTTP server is available immediately
+        const decoupledDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-decoupled-"));
+        for (let i = 0; i < 10; i++) {
+            fs.writeFileSync(path.join(decoupledDir, `file-${i}.txt`), `content-${i}`);
+        }
+        const decoupledServer = new SyncServer({
+            port: 0,
+            host: "127.0.0.1",
+            syncDir: decoupledDir,
+            verbose: false
+        });
+
+        const decoupledInfo = await decoupledServer.start();
+        assert.ok(decoupledInfo.localUrl.startsWith("http://localhost:"));
+
+        // Server should immediately answer HTTP requests
+        const quickStatus = await fetch(`${decoupledInfo.localUrl}/api/status`);
+        assert.equal(quickStatus.status, 200);
+
+        // Wait for background scan to finish and verify all files are hashed
+        const fullManifest = await decoupledServer.getWatcher().initScan();
+        assert.equal(Object.keys(fullManifest.files).length, 10);
+
+        await decoupledServer.stop();
+        fs.rmSync(decoupledDir, { recursive: true, force: true });
     } finally {
         await server.stop();
         fs.rmSync(tempDir, { recursive: true, force: true });

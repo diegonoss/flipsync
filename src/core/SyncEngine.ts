@@ -527,6 +527,10 @@ export class SyncEngine extends EventEmitter {
         return this.token;
     }
 
+    public async waitForInitialScan(): Promise<SyncManifest | null> {
+        return this.watcher ? this.watcher.initScan() : null;
+    }
+
     // =========================================================================
     // Host Mode Implementation
     // =========================================================================
@@ -556,26 +560,9 @@ export class SyncEngine extends EventEmitter {
             this.emit("sync:error", { error: err, context: "watcher" });
         });
 
-        // 1. Initial scan
-        let initialManifest: SyncManifest;
-        try {
-            initialManifest = await this.watcher.initScan();
-        } catch (err: unknown) {
-            const error = err instanceof Error ? err : new Error(String(err));
-            this.stats.errorsCount++;
-            this.emit("sync:error", { error, context: "watcher:initScan" });
-            throw error;
-        }
-
-        const files = Object.values(initialManifest.files);
-        this.stats.totalFiles = files.length;
-        for (const file of files) {
-            this.syncedHashes.set(file.name, file.sha256);
-        }
-
         this.watcher.startWatching();
 
-        // 2. Start HTTP & SSE Server
+        // 1. Start HTTP & SSE Server immediately
         this.server = new SyncServer({
             port: this.port,
             host: this.host,
@@ -606,7 +593,7 @@ export class SyncEngine extends EventEmitter {
             throw error;
         }
 
-        // 3. Optional Tunnel
+        // 2. Optional Tunnel
         if (this.enableTunnel) {
             this.tunnelState = "connecting";
             try {
@@ -650,8 +637,21 @@ export class SyncEngine extends EventEmitter {
         };
 
         this.emit("engine:ready", readyEvent);
-        this.status = "idle";
-        this.emit("sync:idle");
+
+        // 3. Initial directory scan & file hashing run asynchronously in the background
+        this.status = "syncing";
+        void this.watcher.initScan().then((manifest) => {
+            const files = Object.values(manifest.files);
+            this.stats.totalFiles = files.length;
+            for (const file of files) {
+                this.syncedHashes.set(file.name, file.sha256);
+            }
+            this.status = "idle";
+            this.emit("sync:idle");
+        }).catch((err: unknown) => {
+            this.stats.errorsCount++;
+            this.emit("sync:error", { error: err instanceof Error ? err : new Error(String(err)), context: "watcher:initScan" });
+        });
     }
 
     private handleHostFileChange(file: SyncFileMeta): void {

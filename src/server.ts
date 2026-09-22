@@ -64,14 +64,14 @@ export class SyncServer extends EventEmitter {
     }
 
     public async start(): Promise<ServerInfo> {
-        await this.watcher.initScan();
         this.watcher.startWatching();
+        void this.watcher.initScan();
 
         const port = this.options.port ?? 7890;
         const host = this.options.host ?? "0.0.0.0";
 
         return new Promise((resolve, reject) => {
-            this.server = http.createServer((req, res) => this.handleRequest(req, res))
+            this.server = http.createServer((req, res) => void this.handleRequest(req, res))
                 .on("error", reject)
                 .listen(port, host, () => {
                     const addr = this.server?.address();
@@ -150,7 +150,7 @@ export class SyncServer extends EventEmitter {
         res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(data));
     }
 
-    private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
         const parsedUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
         const pathname = parsedUrl.pathname;
 
@@ -188,6 +188,9 @@ export class SyncServer extends EventEmitter {
         }
 
         if (pathname === "/api/manifest") {
+            if (this.watcher.isScanning()) {
+                await this.watcher.initScan();
+            }
             return this.sendJson(res, 200, this.watcher.getManifest());
         }
 
@@ -261,6 +264,10 @@ export class SyncServer extends EventEmitter {
 
             const verbose = this.options.verbose ?? true;
             if (verbose) console.log(`[HOST] Client connected to live sync stream. Total active: ${this.activeClients.size}`);
+
+            if (this.watcher.isScanning()) {
+                await this.watcher.initScan();
+            }
 
             res.write(`event: init\ndata: ${JSON.stringify({ type: "init", timestamp: Date.now(), manifest: this.watcher.getManifest() })}\n\n`);
 

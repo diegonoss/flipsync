@@ -14,6 +14,7 @@ export class DirectoryWatcher extends EventEmitter {
     private readonly pendingTimers = new Map<string, NodeJS.Timeout>();
     private fsWatcher: fs.FSWatcher | null = null;
     private isClosed = false;
+    private scanPromise: Promise<SyncManifest> | null = null;
 
     constructor(syncDir: string, debounceMs = 150) {
         super();
@@ -21,29 +22,43 @@ export class DirectoryWatcher extends EventEmitter {
         this.debounceMs = debounceMs;
     }
 
+    public isScanning(): boolean {
+        return this.scanPromise !== null;
+    }
+
     public async initScan(): Promise<SyncManifest> {
-        fs.mkdirSync(this.syncDir, { recursive: true });
+        if (this.scanPromise) return this.scanPromise;
 
-        const scan = async (dir: string, prefix = ""): Promise<void> => {
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                if (isIgnored(entry.name)) continue;
+        this.scanPromise = (async () => {
+            fs.mkdirSync(this.syncDir, { recursive: true });
 
-                const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-                const fullPath = path.join(dir, entry.name);
+            const scan = async (dir: string, prefix = ""): Promise<void> => {
+                if (this.isClosed) return;
+                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                    if (this.isClosed) return;
+                    if (isIgnored(entry.name)) continue;
 
-                if (entry.isDirectory()) {
-                    await scan(fullPath, relPath);
-                } else if (entry.isFile()) {
-                    const meta = await computeFileHash(fullPath);
-                    if (meta) {
-                        this.cache.set(relPath, { name: relPath, ...meta });
+                    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+                    const fullPath = path.join(dir, entry.name);
+
+                    if (entry.isDirectory()) {
+                        await scan(fullPath, relPath);
+                    } else if (entry.isFile()) {
+                        const meta = await computeFileHash(fullPath);
+                        if (meta && !this.isClosed) {
+                            this.cache.set(relPath, { name: relPath, ...meta });
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        await scan(this.syncDir);
-        return this.getManifest();
+            await scan(this.syncDir);
+            return this.getManifest();
+        })().finally(() => {
+            this.scanPromise = null;
+        });
+
+        return this.scanPromise;
     }
 
     public startWatching(): void {
@@ -114,6 +129,7 @@ export class DirectoryWatcher extends EventEmitter {
 
     public close(): void {
         this.isClosed = true;
+        this.scanPromise = null;
         for (const timer of this.pendingTimers.values()) {
             clearTimeout(timer);
         }
