@@ -225,6 +225,14 @@ export async function testSyncEngine(): Promise<void> {
             await clientEngine.stop();
         }
 
+        // Test cancelTransfers on host
+        let cancelEmitted = false;
+        hostEngine.once("sync:cancelled", () => { cancelEmitted = true; });
+        hostEngine.cancelTransfers();
+        assert.ok(cancelEmitted, "Should emit sync:cancelled");
+        assert.equal(hostEngine.getState().status, "idle");
+        assert.equal(hostEngine.getState().activeTransfers.length, 0);
+
         // Test that client without token rejects on start
         const unauthEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir });
         await assert.rejects(() => unauthEngine.start(), { message: /Authentication failed/ });

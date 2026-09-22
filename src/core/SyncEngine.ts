@@ -6,6 +6,7 @@ import https from "node:https";
 import crypto from "node:crypto";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { setImmediate } from "node:timers/promises";
 import { URL } from "node:url";
 import { computeFileHash } from "../hasher.js";
 import { DirectoryWatcher, isIgnored } from "../watcher.js";
@@ -159,6 +160,7 @@ export class SyncEngine extends EventEmitter {
 
     // Client components
     private currentSseReq: http.ClientRequest | null = null;
+    private currentDownloadReq: http.ClientRequest | null = null;
     private reconnectTimeout: NodeJS.Timeout | null = null;
     private readonly syncedHashes = new Map<string, string>();
 
@@ -248,6 +250,18 @@ export class SyncEngine extends EventEmitter {
         }
     }
 
+    public cancelTransfers(): void {
+        this.watcher?.cancelScan();
+        this.server?.abortTransfers();
+        this.currentDownloadReq?.destroy();
+        this.currentDownloadReq = null;
+        this.activeTransfersMap.clear();
+        this.pausedQueue = [];
+        this.status = "idle";
+        this.emit("sync:cancelled");
+        this.emit("sync:idle");
+    }
+
     public async stop(): Promise<void> {
         this.isRunning = false;
         this.status = "stopped";
@@ -265,6 +279,9 @@ export class SyncEngine extends EventEmitter {
             }
             this.currentSseReq = null;
         }
+
+        this.currentDownloadReq?.destroy();
+        this.currentDownloadReq = null;
 
         if (this.tunnelResult) {
             try {
@@ -757,6 +774,7 @@ export class SyncEngine extends EventEmitter {
                 return;
             }
             for (const entry of entries) {
+                if (!this.isRunning) return;
                 if (isIgnored(entry.name)) continue;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
                 const full = path.join(dir, entry.name);
@@ -767,6 +785,7 @@ export class SyncEngine extends EventEmitter {
                     if (meta) {
                         this.syncedHashes.set(rel, meta.sha256);
                     }
+                    await setImmediate();
                 }
             }
         };
@@ -805,11 +824,13 @@ export class SyncEngine extends EventEmitter {
 
             const filesToDownload: SyncFileMeta[] = [];
             for (const file of files) {
+                if (!this.isRunning || this.status === "idle") break;
                 if (this.syncedHashes.get(file.name) === file.sha256) {
                     continue;
                 }
                 const destPath = path.join(this.syncDir, file.name);
                 const localMeta = await computeFileHash(destPath);
+                await setImmediate();
                 if (localMeta?.sha256 === file.sha256) {
                     this.syncedHashes.set(file.name, file.sha256);
                     continue;
@@ -817,7 +838,7 @@ export class SyncEngine extends EventEmitter {
                 filesToDownload.push(file);
             }
 
-            if (filesToDownload.length > 0) {
+            if (filesToDownload.length > 0 && this.isRunning && this.status !== "idle") {
                 this.status = "syncing";
                 this.emit("sync:start", {
                     count: filesToDownload.length,
@@ -825,7 +846,7 @@ export class SyncEngine extends EventEmitter {
                 });
 
                 for (const file of filesToDownload) {
-                    if (!this.isRunning) break;
+                    if (!this.isRunning || (this.status as SyncEngineStatus) === "idle") break;
                     if (this._isPaused) {
                         this.pausedQueue.push(async () => {
                             await this.downloadFileWithProgress(file);
@@ -965,9 +986,15 @@ export class SyncEngine extends EventEmitter {
                             downloadedHash = hasher.digest("hex");
                             resolve();
                         })
-                        .catch(reject);
+                        .catch(reject)
+                        .finally(() => {
+                            if (this.currentDownloadReq === req) {
+                                this.currentDownloadReq = null;
+                            }
+                        });
                 });
 
+                this.currentDownloadReq = req;
                 req.on("error", reject);
             });
 
@@ -993,7 +1020,10 @@ export class SyncEngine extends EventEmitter {
 
             return true;
         } catch (err: unknown) {
-            fs.rmSync(tempPath, { force: true });
+            try {
+                fs.rmSync(tempPath, { force: true });
+            } catch {}
+            if (!this.isRunning || this.status === "idle") return false;
             const error = err instanceof Error ? err : new Error(String(err));
             if (error.message.includes("Authentication failed")) throw error;
             this.stats.errorsCount++;

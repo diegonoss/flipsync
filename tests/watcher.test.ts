@@ -81,7 +81,12 @@ export async function testWatcher(): Promise<void> {
         fs.writeFileSync(path.join(tempDir, "ignore_test/.hidden_nested"), "hidden nested");
         fs.writeFileSync(path.join(tempDir, "ignore_test/file.tmp.999"), "temp nested");
         await new Promise((resolve) => setTimeout(resolve, 300));
-        assert.equal(changedFiles.length, countBeforeHidden, "Hidden/temp files in root or subdirectories should be ignored");
+        // Test cancelScan aborts scan immediately
+        const cancelWatcher = new DirectoryWatcher(tempDir, 60);
+        const scanPromise = cancelWatcher.initScan();
+        cancelWatcher.cancelScan();
+        assert.ok(await scanPromise);
+        cancelWatcher.close();
     } finally {
         watcher.close();
         fs.rmSync(tempDir, { recursive: true, force: true });

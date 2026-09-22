@@ -24,6 +24,7 @@ export class SyncServer extends EventEmitter {
     private watcher: DirectoryWatcher;
     private server: http.Server | null = null;
     private activeClients = new Set<http.ServerResponse>();
+    private activeDownloads = new Set<http.ServerResponse>();
     private pollWaiters = new Set<{ res: http.ServerResponse; timer: NodeJS.Timeout }>();
     private lastChangeTime = Date.now();
     private keepaliveTimer: NodeJS.Timeout | null = null;
@@ -84,18 +85,34 @@ export class SyncServer extends EventEmitter {
         });
     }
 
+    public abortTransfers(): void {
+        for (const res of this.activeDownloads) {
+            try { res.destroy(); } catch {}
+        }
+        this.activeDownloads.clear();
+    }
+
     public async stop(): Promise<void> {
         if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
         for (const client of this.activeClients) {
-            try { client.end(); } catch {}
+            try { client.destroy(); } catch {}
         }
         this.activeClients.clear();
+        this.abortTransfers();
         this.notifyPollWaiters({ changed: false, timestamp: Date.now() });
         this.watcher.close();
 
         if (this.server) {
-            await new Promise<void>((resolve) => this.server?.close(() => resolve()));
+            const srv = this.server;
             this.server = null;
+            srv.closeAllConnections();
+            await new Promise<void>((resolve) => {
+                const timer = setTimeout(resolve, 500);
+                srv.close(() => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+            });
         }
     }
 
@@ -256,6 +273,7 @@ export class SyncServer extends EventEmitter {
             let transferred = 0;
             let lastTime = 0;
             const stream = fs.createReadStream(safePath);
+            this.activeDownloads.add(res);
 
             stream.on("data", (chunk: Buffer | string) => {
                 transferred += chunk.length;
@@ -268,6 +286,7 @@ export class SyncServer extends EventEmitter {
             stream.on("error", () => res.destroy());
 
             finished(res, (err) => {
+                this.activeDownloads.delete(res);
                 stream.destroy();
                 this.emit(err ? "file_aborted" : "file_served", { id: transferId, file: filename, size: stat.size, clientIp });
             });

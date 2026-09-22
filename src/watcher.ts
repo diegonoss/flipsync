@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { setImmediate } from "node:timers/promises";
 import { watch, type FSWatcher } from "chokidar";
 import { computeFileHash } from "./hasher.js";
 import type { SyncFileMeta, SyncManifest } from "./types.js";
@@ -28,6 +29,7 @@ export class DirectoryWatcher extends EventEmitter {
     private fsWatcher: FSWatcher | null = null;
     private isClosed = false;
     private scanPromise: Promise<SyncManifest> | null = null;
+    private scanAbortController: AbortController | null = null;
 
     constructor(syncDir: string, debounceMs = 150) {
         super();
@@ -39,9 +41,18 @@ export class DirectoryWatcher extends EventEmitter {
         return this.scanPromise !== null;
     }
 
+    public cancelScan(): void {
+        this.scanAbortController?.abort();
+        this.scanAbortController = null;
+    }
+
     public async initScan(): Promise<SyncManifest> {
         if (this.isClosed) return this.getManifest();
         if (this.scanPromise) return this.scanPromise;
+
+        const abortController = new AbortController();
+        this.scanAbortController = abortController;
+        const signal = abortController.signal;
 
         this.scanPromise = (async () => {
             try {
@@ -51,7 +62,7 @@ export class DirectoryWatcher extends EventEmitter {
             }
 
             const scan = async (dir: string, prefix = ""): Promise<void> => {
-                if (this.isClosed) return;
+                if (this.isClosed || signal.aborted) return;
                 let entries: fs.Dirent[];
                 try {
                     entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -60,7 +71,8 @@ export class DirectoryWatcher extends EventEmitter {
                 }
 
                 for (const entry of entries) {
-                    if (this.isClosed || isIgnored(entry.name)) continue;
+                    if (this.isClosed || signal.aborted) return;
+                    if (isIgnored(entry.name)) continue;
                     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
                     const fullPath = path.join(dir, entry.name);
 
@@ -75,10 +87,11 @@ export class DirectoryWatcher extends EventEmitter {
                             }
                         }
 
-                        const meta = await computeFileHash(fullPath);
+                        const meta = await computeFileHash(fullPath, 5, 40, signal);
                         if (meta && !this.isClosed) {
                             this.cache.set(relPath, { name: relPath, ...meta });
                         }
+                        await setImmediate();
                     }
                 }
             };
@@ -86,6 +99,7 @@ export class DirectoryWatcher extends EventEmitter {
             await scan(this.syncDir);
             return this.getManifest();
         })().finally(() => {
+            this.scanAbortController = null;
             this.scanPromise = null;
         });
 
@@ -188,6 +202,7 @@ export class DirectoryWatcher extends EventEmitter {
 
     public close(): void {
         this.isClosed = true;
+        this.cancelScan();
         this.scanPromise = null;
         for (const timer of this.pendingTimers.values()) {
             clearTimeout(timer);

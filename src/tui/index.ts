@@ -214,7 +214,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         const state = engine.getState();
         const statusText = state.isPaused ? "PAUSED (press p to resume)" : state.status.toUpperCase();
         footerBox.setContent(
-            ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[r]{/} Re-hash  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
+            ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[x]{/} Cancel  {bold}[r]{/} Re-sync  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
         );
     };
 
@@ -298,28 +298,32 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         scheduleRender();
     });
 
+    engine.on("sync:cancelled", () => {
+        addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow");
+        scheduleRender();
+    });
+
     // Keybindings & Shutdown
+    const restoreTerminalAndExit = (code: number): void => {
+        try {
+            screen.destroy();
+        } catch {
+            // Ignore
+        }
+        process.stdout.write("\x1b[?1049l\x1b[?25h");
+        process.exit(code);
+    };
+
     const cleanExit = async (code = 0): Promise<void> => {
-        if (isExiting) return;
+        if (isExiting) return restoreTerminalAndExit(code);
         isExiting = true;
 
-        if (renderTimer) {
-            clearTimeout(renderTimer);
-            renderTimer = null;
-        }
+        const forceExitTimer = setTimeout(() => restoreTerminalAndExit(code), 1500);
+        forceExitTimer.unref();
 
-        if (renderInterval) {
-            clearInterval(renderInterval);
-        }
-
-        if (activeCommandModal) {
-            try {
-                activeCommandModal.close();
-            } catch {
-                // Ignore
-            }
-            activeCommandModal = null;
-        }
+        if (renderTimer) clearTimeout(renderTimer);
+        clearInterval(renderInterval);
+        try { activeCommandModal?.close(); } catch {}
 
         try {
             await engine.stop();
@@ -327,15 +331,8 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             // Ignore during shutdown
         }
 
-        try {
-            screen.destroy();
-        } catch {
-            // Ignore
-        }
-
-        // Guarantee cursor is visible and terminal alternate screen buffer is restored
-        process.stdout.write("\x1b[?1049l\x1b[?25h");
-        process.exit(code);
+        clearTimeout(forceExitTimer);
+        restoreTerminalAndExit(code);
     };
 
     const showCommandModal = () => {
@@ -396,7 +393,9 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         }
     });
 
-    screen.key(["q", "C-c"], () => {
+    screen.key(["C-c"], () => cleanExit(0));
+
+    screen.key(["q", "Q"], () => {
         if (isCommandModalOpen) {
             activeCommandModal?.close();
             return;
@@ -404,6 +403,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         if (!isPickerOpen) {
             cleanExit(0);
         }
+    });
+
+    screen.key(["x", "X"], () => {
+        if (!isPickerOpen && !isCommandModalOpen) engine.cancelTransfers();
     });
 
     screen.key(["p", "P"], () => {
@@ -458,8 +461,8 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     });
 
     // Handle OS signals
-    process.once("SIGINT", () => cleanExit(0));
-    process.once("SIGTERM", () => cleanExit(0));
+    process.on("SIGINT", () => cleanExit(0));
+    process.on("SIGTERM", () => cleanExit(0));
 
     // Periodic UI refresh for speed calculations and clock
     const renderInterval = setInterval(() => {
