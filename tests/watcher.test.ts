@@ -22,7 +22,7 @@ export async function testWatcher(): Promise<void> {
         assert.equal(manifest.files["fileA.txt"].size, 12);
         assert.equal(manifest.files["sub/nested.txt"].size, 12);
 
-        watcher.startWatching();
+        await watcher.startWatching();
 
         const changedFiles: string[] = [];
         watcher.on("change", (f) => changedFiles.push(f.name));
@@ -44,20 +44,44 @@ export async function testWatcher(): Promise<void> {
         assert.equal(changedFiles.length, countBefore + 1, "Modified content should emit change");
 
         // Delete fileB
-        let deletedFile = "";
+        const deletedFiles: string[] = [];
         watcher.on("delete", (name) => {
-            deletedFile = name;
+            deletedFiles.push(name);
         });
         fs.unlinkSync(path.join(tempDir, "fileB.txt"));
         await new Promise((resolve) => setTimeout(resolve, 300));
-        assert.equal(deletedFile, "fileB.txt", "Deletion should emit delete event");
+        assert.ok(deletedFiles.includes("fileB.txt"), "Deletion should emit delete event");
 
-        // Ignore temporary / hidden files
+        // Subdirectory modification
+        fs.writeFileSync(path.join(tempDir, "sub/nested.txt"), "hello nested modified");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.ok(changedFiles.includes("sub/nested.txt"), "sub/nested.txt modification should trigger change event");
+
+        // Dynamic nested directory creation and file addition
+        fs.mkdirSync(path.join(tempDir, "new_sub/deep"), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, "new_sub/deep/nested.txt"), "hello deep nested");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.ok(changedFiles.includes("new_sub/deep/nested.txt"), "Dynamically added nested file should trigger change event");
+
+        // Subdirectory file deletion
+        fs.unlinkSync(path.join(tempDir, "sub/nested.txt"));
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.ok(deletedFiles.includes("sub/nested.txt"), "sub/nested.txt deletion should emit delete event");
+
+        // Subdirectory recursive deletion
+        fs.rmSync(path.join(tempDir, "new_sub"), { recursive: true, force: true });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.ok(deletedFiles.includes("new_sub/deep/nested.txt"), "Removing folder should emit delete event for nested files");
+
+        // Ignore temporary / hidden files (including inside subdirectories)
         const countBeforeHidden = changedFiles.length;
         fs.writeFileSync(path.join(tempDir, ".hidden.txt"), "hidden content");
         fs.writeFileSync(path.join(tempDir, ".fileA.tmp.12345"), "temp content");
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.equal(changedFiles.length, countBeforeHidden, "Hidden/temp files should be ignored");
+        fs.mkdirSync(path.join(tempDir, "ignore_test"), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, "ignore_test/.hidden_nested"), "hidden nested");
+        fs.writeFileSync(path.join(tempDir, "ignore_test/file.tmp.999"), "temp nested");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(changedFiles.length, countBeforeHidden, "Hidden/temp files in root or subdirectories should be ignored");
     } finally {
         watcher.close();
         fs.rmSync(tempDir, { recursive: true, force: true });

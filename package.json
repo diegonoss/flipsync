@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "blessed": "^0.1.81",
+    "chokidar": "^5.0.0",
     "commander": "^15.0.0",
     "flipsync": "link:"
   }

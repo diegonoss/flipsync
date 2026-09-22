@@ -65,7 +65,7 @@ export class SyncServer extends EventEmitter {
     }
 
     public async start(): Promise<ServerInfo> {
-        this.watcher.startWatching();
+        await this.watcher.startWatching();
         void this.watcher.initScan();
 
         const port = this.options.port ?? 7890;

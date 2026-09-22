@@ -14,27 +14,24 @@ export async function computeFileHash(
 ): Promise<{ sha256: string; size: number; mtimeMs: number } | null> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-            const stat = fs.statSync(filePath, { throwIfNoEntry: false });
-            if (!stat?.isFile()) {
-                return null;
-            }
-            // If the file is 0 bytes, it might be mid-truncation during a build write.
-            // Wait briefly unless it remains 0 on the final attempt.
-            if (stat.size === 0 && attempt < maxRetries - 1) {
+            const stat = await fs.promises.stat(filePath);
+            if (!stat.isFile()) return null;
+
+            // If the file is 0 bytes and was modified within the last 500ms,
+            // it may be mid-truncation during a live build write. Wait once.
+            if (stat.size === 0 && Date.now() - stat.mtimeMs < 500 && attempt === 0 && maxRetries > 1) {
                 await setTimeout(retryDelayMs);
                 continue;
             }
             const hash = crypto.createHash("sha256");
-            await pipeline(fs.createReadStream(filePath), hash);
+            await pipeline(fs.createReadStream(filePath, { highWaterMark: 256 * 1024 }), hash);
             return {
                 sha256: hash.digest("hex"),
                 size: stat.size,
                 mtimeMs: stat.mtimeMs
             };
         } catch {
-            if (attempt < maxRetries - 1) {
-                await setTimeout(retryDelayMs);
-            }
+            if (attempt < maxRetries - 1) await setTimeout(retryDelayMs);
         }
     }
     return null;

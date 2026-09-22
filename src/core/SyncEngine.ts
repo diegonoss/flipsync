@@ -8,7 +8,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { URL } from "node:url";
 import { computeFileHash } from "../hasher.js";
-import { DirectoryWatcher } from "../watcher.js";
+import { DirectoryWatcher, isIgnored } from "../watcher.js";
 import { SyncServer } from "../server.js";
 import { startAutoTunnel, detectTailscaleIp, getLocalLanIp } from "../tunnel.js";
 import type { SyncFileMeta, SyncManifest, SyncEvent, TunnelResult } from "../types.js";
@@ -560,7 +560,7 @@ export class SyncEngine extends EventEmitter {
             this.emit("sync:error", { error: err, context: "watcher" });
         });
 
-        this.watcher.startWatching();
+        await this.watcher.startWatching();
 
         // 1. Start HTTP & SSE Server immediately
         this.server = new SyncServer({
@@ -749,12 +749,15 @@ export class SyncEngine extends EventEmitter {
 
     private async scanLocalTargetDir(): Promise<void> {
         const scanDir = async (dir: string, relPrefix = ""): Promise<void> => {
-            if (!fs.existsSync(dir)) return;
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            if (!this.isRunning) return;
+            let entries: fs.Dirent[];
+            try {
+                entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            } catch {
+                return;
+            }
             for (const entry of entries) {
-                if (entry.name.startsWith(".") || entry.name.includes(".tmp.") || entry.name === "node_modules") {
-                    continue;
-                }
+                if (isIgnored(entry.name)) continue;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
                 const full = path.join(dir, entry.name);
                 if (entry.isDirectory()) {
@@ -802,13 +805,14 @@ export class SyncEngine extends EventEmitter {
 
             const filesToDownload: SyncFileMeta[] = [];
             for (const file of files) {
+                if (this.syncedHashes.get(file.name) === file.sha256) {
+                    continue;
+                }
                 const destPath = path.join(this.syncDir, file.name);
-                if (fs.existsSync(destPath)) {
-                    const localMeta = await computeFileHash(destPath);
-                    if (localMeta && localMeta.sha256 === file.sha256) {
-                        this.syncedHashes.set(file.name, file.sha256);
-                        continue;
-                    }
+                const localMeta = await computeFileHash(destPath);
+                if (localMeta?.sha256 === file.sha256) {
+                    this.syncedHashes.set(file.name, file.sha256);
+                    continue;
                 }
                 filesToDownload.push(file);
             }

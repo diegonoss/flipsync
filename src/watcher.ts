@@ -1,18 +1,31 @@
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { watch, type FSWatcher } from "chokidar";
 import { computeFileHash } from "./hasher.js";
 import type { SyncFileMeta, SyncManifest } from "./types.js";
 
-const isIgnored = (name: string) =>
-    name.startsWith(".") || name.includes(".tmp.") || name === "node_modules";
+export const isIgnored = (name: string) =>
+    name.startsWith(".") ||
+    name.includes(".tmp.") ||
+    name === "node_modules" ||
+    name.endsWith(".crdownload") ||
+    name.endsWith(".part") ||
+    name.endsWith(".download") ||
+    name.startsWith("~$");
+
+export const isIgnoredPath = (relPath: string) =>
+    Boolean(relPath && relPath !== "." && relPath.split(/[\\/]/).some(isIgnored));
+
+const toRelPath = (baseDir: string, filePath: string) =>
+    (path.isAbsolute(filePath) ? path.relative(baseDir, filePath) : filePath).replace(/\\/g, "/");
 
 export class DirectoryWatcher extends EventEmitter {
     private readonly syncDir: string;
     private readonly debounceMs: number;
     private readonly cache = new Map<string, SyncFileMeta>();
     private readonly pendingTimers = new Map<string, NodeJS.Timeout>();
-    private fsWatcher: fs.FSWatcher | null = null;
+    private fsWatcher: FSWatcher | null = null;
     private isClosed = false;
     private scanPromise: Promise<SyncManifest> | null = null;
 
@@ -27,23 +40,41 @@ export class DirectoryWatcher extends EventEmitter {
     }
 
     public async initScan(): Promise<SyncManifest> {
+        if (this.isClosed) return this.getManifest();
         if (this.scanPromise) return this.scanPromise;
 
         this.scanPromise = (async () => {
-            fs.mkdirSync(this.syncDir, { recursive: true });
+            try {
+                await fs.promises.mkdir(this.syncDir, { recursive: true });
+            } catch {
+                return this.getManifest();
+            }
 
             const scan = async (dir: string, prefix = ""): Promise<void> => {
                 if (this.isClosed) return;
-                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                    if (this.isClosed) return;
-                    if (isIgnored(entry.name)) continue;
+                let entries: fs.Dirent[];
+                try {
+                    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+                } catch {
+                    return;
+                }
 
+                for (const entry of entries) {
+                    if (this.isClosed || isIgnored(entry.name)) continue;
                     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
                     const fullPath = path.join(dir, entry.name);
 
                     if (entry.isDirectory()) {
                         await scan(fullPath, relPath);
                     } else if (entry.isFile()) {
+                        const existing = this.cache.get(relPath);
+                        if (existing) {
+                            const stat = await fs.promises.stat(fullPath).catch(() => null);
+                            if (stat && existing.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1) {
+                                continue;
+                            }
+                        }
+
                         const meta = await computeFileHash(fullPath);
                         if (meta && !this.isClosed) {
                             this.cache.set(relPath, { name: relPath, ...meta });
@@ -61,25 +92,47 @@ export class DirectoryWatcher extends EventEmitter {
         return this.scanPromise;
     }
 
-    public startWatching(): void {
+    public async startWatching(): Promise<void> {
         if (this.isClosed || this.fsWatcher) return;
 
-        fs.mkdirSync(this.syncDir, { recursive: true });
+        await fs.promises.mkdir(this.syncDir, { recursive: true });
 
-        try {
-            this.fsWatcher = fs.watch(this.syncDir, { recursive: true }, (_eventType, filename) => {
-                if (!filename) return;
+        return new Promise<void>((resolve) => {
+            try {
+                this.fsWatcher = watch(this.syncDir, {
+                    ignoreInitial: true,
+                    cwd: this.syncDir,
+                    ignored: (filePath: string) => isIgnoredPath(toRelPath(this.syncDir, filePath))
+                });
 
-                const normalized = filename.split(path.sep).join("/");
-                if (normalized.split("/").some(isIgnored)) return;
+                this.fsWatcher.on("ready", () => resolve());
+                this.fsWatcher.on("error", (err) => {
+                    this.emit("error", err instanceof Error ? err : new Error(String(err)));
+                    resolve();
+                });
 
-                this.scheduleEvaluation(normalized);
-            });
+                this.fsWatcher.on("all", (event, filePath) => {
+                    if (!filePath || event === "addDir") return;
+                    const relPath = toRelPath(this.syncDir, filePath);
+                    if (!relPath || relPath === "." || isIgnoredPath(relPath)) return;
 
-            this.fsWatcher.on("error", (err) => this.emit("error", err));
-        } catch (err: unknown) {
-            this.emit("error", err instanceof Error ? err : new Error(String(err)));
-        }
+                    if (event === "unlinkDir") {
+                        const dirPrefix = relPath.endsWith("/") ? relPath : `${relPath}/`;
+                        for (const key of this.cache.keys()) {
+                            if (key.startsWith(dirPrefix)) {
+                                this.scheduleEvaluation(key);
+                            }
+                        }
+                        return;
+                    }
+
+                    this.scheduleEvaluation(relPath);
+                });
+            } catch (err: unknown) {
+                this.emit("error", err instanceof Error ? err : new Error(String(err)));
+                resolve();
+            }
+        });
     }
 
     public getManifest(): SyncManifest {
@@ -104,24 +157,30 @@ export class DirectoryWatcher extends EventEmitter {
             if (this.isClosed) return;
 
             const fullPath = path.join(this.syncDir, relPath);
-            if (!fs.existsSync(fullPath)) {
+            try {
+                const stat = await fs.promises.stat(fullPath);
+                if (!stat.isFile()) throw new Error();
+
+                const existing = this.cache.get(relPath);
+                if (existing && existing.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1) {
+                    return;
+                }
+
+                const meta = await computeFileHash(fullPath);
+                if (!meta) throw new Error();
+
+                if (existing && existing.sha256 === meta.sha256 && existing.size === meta.size) {
+                    return;
+                }
+
+                const updated: SyncFileMeta = { name: relPath, ...meta };
+                this.cache.set(relPath, updated);
+                this.emit("change", updated);
+            } catch {
                 if (this.cache.delete(relPath)) {
                     this.emit("delete", relPath);
                 }
-                return;
             }
-
-            const meta = await computeFileHash(fullPath);
-            if (!meta) return;
-
-            const existing = this.cache.get(relPath);
-            if (existing && existing.sha256 === meta.sha256 && existing.size === meta.size) {
-                return;
-            }
-
-            const updated: SyncFileMeta = { name: relPath, ...meta };
-            this.cache.set(relPath, updated);
-            this.emit("change", updated);
         }, this.debounceMs);
 
         this.pendingTimers.set(relPath, timer);
@@ -135,7 +194,7 @@ export class DirectoryWatcher extends EventEmitter {
         }
         this.pendingTimers.clear();
 
-        this.fsWatcher?.close();
+        void this.fsWatcher?.close();
         this.fsWatcher = null;
     }
 }

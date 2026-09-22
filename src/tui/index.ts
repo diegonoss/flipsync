@@ -102,6 +102,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         tags: true,
         label: " Activity Log & Conflict Notices ",
         scrollable: true,
+        scrollback: 1000,
         scrollbar: {
             ch: " ",
             track: { bg: "cyan" },
@@ -136,7 +137,6 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     const addLog = (tag: string, message: string, color = "white") => {
         const time = getFormattedTime();
         logBox.add(`{gray-fg}[${time}]{/} {${color}-fg}[${tag}]{/} ${message}`);
-        screen.render();
     };
 
     const renderHeader = () => {
@@ -216,13 +216,26 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         );
     };
 
+    let isExiting = false;
+    let isPickerOpen = false;
+    let isCommandModalOpen = false;
+    let activeCommandModal: { close: () => void } | null = null;
+    let renderTimer: NodeJS.Timeout | null = null;
+
     const updateAll = () => {
+        if (isExiting || isPickerOpen || isCommandModalOpen) return;
         renderHeader();
         renderTransferPanel();
         renderFooter();
-        if (!isPickerOpen && !isCommandModalOpen) {
-            screen.render();
-        }
+        screen.render();
+    };
+
+    const scheduleRender = () => {
+        if (renderTimer) return;
+        renderTimer = setTimeout(() => {
+            renderTimer = null;
+            updateAll();
+        }, 50);
     };
 
     // Wire up SyncEngine events to TUI
@@ -231,28 +244,27 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         if (event.tunnelUrl) {
             addLog("TUNNEL", `Cloudflare public tunnel active: ${event.tunnelUrl}`, "cyan");
         }
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:start", (event: SyncStartEvent) => {
         addLog("SYNC", `Batch sync started: ${event.count} file(s)`, "blue");
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:file-progress", (_event: SyncFileProgressEvent) => {
-        renderTransferPanel();
-        screen.render();
+        scheduleRender();
     });
 
     engine.on("sync:file-complete", (event: SyncFileCompleteEvent) => {
         addLog("COMPLETE", `Synchronized {bold}${event.file}{/} (${event.hash.slice(0, 8)}...)`, "green");
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:file-served", (event: SyncFileServedEvent) => {
         const kb = (event.size / 1024).toFixed(1);
         addLog("SERVED", `Sent {bold}${event.file}{/} (${kb} KB) to ${event.clientIp}`, "cyan");
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:conflict", (event: SyncConflictEvent) => {
@@ -261,38 +273,38 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             `Conflict on {bold}${event.file}{/}! Local: ${event.localVersion} Remote: ${event.remoteVersion}`,
             "magenta"
         );
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:error", (event: SyncErrorEvent) => {
         const ctx = event.context ? `[${event.context}] ` : "";
         addLog("ERROR", `${ctx}${event.error.message}`, "red");
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("sync:idle", () => {
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("engine:pause", () => {
         addLog("PAUSE", "Synchronization paused by user.", "yellow");
-        updateAll();
+        scheduleRender();
     });
 
     engine.on("engine:resume", () => {
         addLog("RESUME", "Synchronization resumed.", "green");
-        updateAll();
+        scheduleRender();
     });
 
     // Keybindings & Shutdown
-    let isExiting = false;
-    let isPickerOpen = false;
-    let isCommandModalOpen = false;
-    let activeCommandModal: { close: () => void } | null = null;
-
     const cleanExit = async (code = 0): Promise<void> => {
         if (isExiting) return;
         isExiting = true;
+
+        if (renderTimer) {
+            clearTimeout(renderTimer);
+            renderTimer = null;
+        }
 
         if (renderInterval) {
             clearInterval(renderInterval);
