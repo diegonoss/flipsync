@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { setTimeout } from "node:timers/promises";
+import { pipeline } from "node:stream/promises";
 
 export function computeBufferHash(buffer: Buffer | Uint8Array): string {
     return crypto.createHash("sha256").update(buffer).digest("hex");
@@ -23,8 +24,10 @@ export async function computeFileHash(
                 await setTimeout(retryDelayMs);
                 continue;
             }
+            const hash = crypto.createHash("sha256");
+            await pipeline(fs.createReadStream(filePath), hash);
             return {
-                sha256: computeBufferHash(fs.readFileSync(filePath)),
+                sha256: hash.digest("hex"),
                 size: stat.size,
                 mtimeMs: stat.mtimeMs
             };

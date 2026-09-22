@@ -188,6 +188,20 @@ export async function testSyncEngine(): Promise<void> {
             assert.equal(conflictEvents[0].file, "live.txt");
             assert.ok(conflictEvents[0].localVersion, "Conflict should include localVersion");
             assert.ok(conflictEvents[0].remoteVersion, "Conflict should include remoteVersion");
+
+            // Test streaming transfer of a multi-chunk file
+            progressEvents.length = 0;
+            clientCompleted.length = 0;
+            const largeData = Buffer.alloc(256 * 1024, "f");
+            fs.writeFileSync(path.join(hostDir, "stream-large.bin"), largeData);
+
+            await new Promise((r) => setTimeout(r, 600));
+            assert.ok(fs.existsSync(path.join(clientDir, "stream-large.bin")), "stream-large.bin should sync to client");
+            assert.equal(fs.readFileSync(path.join(clientDir, "stream-large.bin")).length, largeData.length);
+            assert.ok(clientCompleted.some((c) => c.file === "stream-large.bin"), "stream-large.bin should emit completion");
+            // Verify no leftover .tmp files
+            const clientFiles = fs.readdirSync(clientDir);
+            assert.ok(!clientFiles.some((f) => f.includes(".tmp.")), "No temporary files should remain");
         } finally {
             await clientEngine.stop();
         }

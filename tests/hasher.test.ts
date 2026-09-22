@@ -31,6 +31,23 @@ export async function testHasher(): Promise<void> {
         const invalid = await verifyFileHash(testFile, "0000000000000000000000000000000000000000000000000000000000000000");
         assert.equal(invalid, false);
 
+        // Empty file (0 bytes)
+        const emptyFile = path.join(tempDir, "empty.txt");
+        fs.writeFileSync(emptyFile, Buffer.alloc(0));
+        const emptyMeta = await computeFileHash(emptyFile);
+        assert.ok(emptyMeta);
+        assert.equal(emptyMeta.sha256, computeBufferHash(Buffer.alloc(0)));
+        assert.equal(emptyMeta.size, 0);
+
+        // Multi-chunk large file (256 KB)
+        const largeBuf = Buffer.alloc(256 * 1024, "a");
+        const largeFile = path.join(tempDir, "large.bin");
+        fs.writeFileSync(largeFile, largeBuf);
+        const largeMeta = await computeFileHash(largeFile);
+        assert.ok(largeMeta);
+        assert.equal(largeMeta.sha256, computeBufferHash(largeBuf));
+        assert.equal(largeMeta.size, largeBuf.length);
+
         // Non-existent file
         const missing = await computeFileHash(path.join(tempDir, "nonexistent.txt"), 2, 10);
         assert.equal(missing, null);

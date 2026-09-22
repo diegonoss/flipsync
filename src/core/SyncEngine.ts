@@ -4,8 +4,10 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { URL } from "node:url";
-import { computeBufferHash, computeFileHash } from "../hasher.js";
+import { computeFileHash } from "../hasher.js";
 import { DirectoryWatcher } from "../watcher.js";
 import { SyncServer } from "../server.js";
 import { startAutoTunnel, detectTailscaleIp, getLocalLanIp } from "../tunnel.js";
@@ -873,110 +875,99 @@ export class SyncEngine extends EventEmitter {
         };
         this.activeTransfersMap.set(file.name, transferInfo);
 
-        let buffer: Buffer;
+        const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
+        let downloadedHash = "";
+        let context = `download:${file.name}`;
+
         try {
-            buffer = await new Promise<Buffer>((resolve, reject) => {
+            await new Promise<void>((resolve, reject) => {
                 const parsed = new URL(downloadUrl);
-                const isHttps = parsed.protocol === "https:";
-                const transport = isHttps ? https : http;
+                const transport = parsed.protocol === "https:" ? https : http;
 
                 const req = transport.get(parsed, (res) => {
                     if (res.statusCode === 401 || res.statusCode === 403) {
-                        reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
-                        return;
+                        res.resume();
+                        return reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
                     }
                     if (res.statusCode !== 200) {
-                        reject(new Error(`Download failed with status ${res.statusCode}`));
-                        return;
+                        res.resume();
+                        return reject(new Error(`Download failed with status ${res.statusCode}`));
                     }
 
-                    const contentLength = parseInt(res.headers["content-length"] || "0", 10);
-                    const total = contentLength || file.size;
+                    const total = parseInt(res.headers["content-length"] || "0", 10) || file.size;
                     transferInfo.total = total;
 
-                    let transferred = 0;
-                    const chunks: Buffer[] = [];
+                    const hasher = crypto.createHash("sha256");
+                    const progressStream = new Transform({
+                        transform: (chunk: Buffer, _enc, cb) => {
+                            hasher.update(chunk);
+                            transferInfo.transferred += chunk.length;
+                            const now = Date.now();
+                            const timeDiff = (now - lastUpdateTime) / 1000;
 
-                    res.on("data", (chunk: Buffer) => {
-                        chunks.push(chunk);
-                        transferred += chunk.length;
-                        const now = Date.now();
-                        const timeDiff = (now - lastUpdateTime) / 1000;
+                            if (timeDiff >= 0.1 || transferInfo.transferred >= total) {
+                                transferInfo.speedBps = timeDiff > 0 ? (transferInfo.transferred - lastTransferred) / timeDiff : 0;
+                                transferInfo.percent = total > 0 ? Math.min(100, Math.round((transferInfo.transferred / total) * 100)) : 100;
+                                lastUpdateTime = now;
+                                lastTransferred = transferInfo.transferred;
 
-                        if (timeDiff >= 0.1 || transferred >= total) {
-                            const speed = timeDiff > 0 ? (transferred - lastTransferred) / timeDiff : 0;
-                            transferInfo.speedBps = speed;
-                            transferInfo.transferred = transferred;
-                            transferInfo.percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
-                            lastUpdateTime = now;
-                            lastTransferred = transferred;
-
-                            this.emit("sync:file-progress", {
-                                file: file.name,
-                                transferred,
-                                total,
-                                percent: transferInfo.percent
-                            });
+                                this.emit("sync:file-progress", {
+                                    file: file.name,
+                                    transferred: transferInfo.transferred,
+                                    total,
+                                    percent: transferInfo.percent
+                                });
+                            }
+                            cb(null, chunk);
+                        },
+                        flush: (cb) => {
+                            transferInfo.percent = 100;
+                            cb();
                         }
                     });
 
-                    res.on("end", () => {
-                        transferInfo.transferred = transferred;
-                        transferInfo.percent = 100;
-                        resolve(Buffer.concat(chunks));
-                    });
-
-                    res.on("error", reject);
+                    pipeline(res, progressStream, fs.createWriteStream(tempPath))
+                        .then(() => {
+                            downloadedHash = hasher.digest("hex");
+                            resolve();
+                        })
+                        .catch(reject);
                 });
 
                 req.on("error", reject);
             });
+
+            // Verify SHA-256 integrity
+            context = `verify:${file.name}`;
+            if (downloadedHash !== file.sha256) {
+                throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
+            }
+
+            // Atomic write
+            context = `write:${file.name}`;
+            fs.renameSync(tempPath, destPath);
+
+            this.syncedHashes.set(file.name, downloadedHash);
+            this.stats.syncedFiles++;
+            this.stats.bytesTransferred += transferInfo.transferred;
+            this.stats.lastSyncTime = Date.now();
+
+            this.emit("sync:file-complete", {
+                file: file.name,
+                hash: downloadedHash
+            });
+
+            return true;
         } catch (err: unknown) {
-            this.activeTransfersMap.delete(file.name);
+            fs.rmSync(tempPath, { force: true });
             const error = err instanceof Error ? err : new Error(String(err));
             if (error.message.includes("Authentication failed")) throw error;
             this.stats.errorsCount++;
-            this.emit("sync:error", { error, context: `download:${file.name}` });
+            this.emit("sync:error", { error, context });
             throw error;
-        }
-
-        // Verify SHA-256 integrity
-        const downloadedHash = computeBufferHash(buffer);
-        if (downloadedHash !== file.sha256) {
+        } finally {
             this.activeTransfersMap.delete(file.name);
-            const error = new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
-            this.stats.errorsCount++;
-            this.emit("sync:error", { error, context: `verify:${file.name}` });
-            throw error;
         }
-
-        // Atomic write
-        const tempFilename = `.${path.basename(file.name)}.tmp.${Date.now()}`;
-        const tempPath = path.join(destDir, tempFilename);
-
-        try {
-            fs.writeFileSync(tempPath, buffer);
-            fs.renameSync(tempPath, destPath);
-        } catch (err: unknown) {
-            this.activeTransfersMap.delete(file.name);
-            const error = err instanceof Error ? err : new Error(String(err));
-            this.stats.errorsCount++;
-            this.emit("sync:error", { error, context: `write:${file.name}` });
-            throw error;
-        }
-
-        this.activeTransfersMap.delete(file.name);
-        this.syncedHashes.set(file.name, downloadedHash);
-        this.stats.syncedFiles++;
-        this.stats.bytesTransferred += buffer.length;
-        this.stats.lastSyncTime = Date.now();
-
-        this.emit("sync:file-complete", {
-            file: file.name,
-            hash: downloadedHash
-        });
-
-        return true;
     }
 
     private connectSse(retryDelayMs = 1000): void {
