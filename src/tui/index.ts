@@ -5,7 +5,6 @@ import type {
     SyncEngine,
     SyncEngineReadyEvent,
     SyncStartEvent,
-    SyncFileProgressEvent,
     SyncFileCompleteEvent,
     SyncConflictEvent,
     SyncErrorEvent,
@@ -22,24 +21,20 @@ export interface TuiController {
 }
 
 function formatBytes(bytes: number): string {
-    if (bytes === 0) return "0 B";
-    const k = 1024;
-    const sizes = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+    if (bytes <= 0) return "0 B";
+    const sizes = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return `${(bytes / 1024 ** i).toFixed(1)} ${sizes[i] ?? "TB"}`;
 }
 
-function formatSpeed(bytesPerSec: number): string {
-    if (bytesPerSec <= 0) return "0 B/s";
-    return `${formatBytes(bytesPerSec)}/s`;
-}
+const formatSpeed = (bytesPerSec: number): string =>
+    bytesPerSec <= 0 ? "0 B/s" : `${formatBytes(bytesPerSec)}/s`;
 
 function renderProgressBar(percent: number, width = 26): string {
     const p = Math.max(0, Math.min(100, percent));
     const filled = Math.round((p / 100) * width);
-    const empty = width - filled;
     const bar = "=".repeat(Math.max(0, filled - 1)) + (filled > 0 ? ">" : "");
-    return `[${bar}${" ".repeat(empty)}] ${p.toString().padStart(3, " ")}%`;
+    return `[${bar.padEnd(width, " ")}] ${p.toString().padStart(3, " ")}%`;
 }
 
 export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Promise<TuiController> {
@@ -58,7 +53,6 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         autoPadding: true
     });
 
-    // 1. Header Box
     const headerBox = blessed.box({
         parent: screen,
         top: 0,
@@ -66,14 +60,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         width: "100%",
         height: 8,
         border: { type: "line" },
-        style: {
-            border: { fg: "cyan" }
-        },
+        style: { border: { fg: "cyan" } },
         tags: true,
         label: " FlipSync Status & Endpoints "
     });
 
-    // 2. Transfer Panel
     const transferBox = blessed.box({
         parent: screen,
         top: 8,
@@ -81,14 +72,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         width: "100%",
         height: 9,
         border: { type: "line" },
-        style: {
-            border: { fg: "blue" }
-        },
+        style: { border: { fg: "blue" } },
         tags: true,
         label: " Active Transfers & Sync Progress "
     });
 
-    // 3. Event Log
     const logBox = blessed.log({
         parent: screen,
         top: 17,
@@ -96,9 +84,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         width: "100%",
         bottom: 2,
         border: { type: "line" },
-        style: {
-            border: { fg: "white" }
-        },
+        style: { border: { fg: "white" } },
         tags: true,
         label: " Activity Log & Conflict Notices ",
         scrollable: true,
@@ -112,31 +98,19 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         keys: true
     });
 
-    // 4. Footer Panel
     const footerBox = blessed.box({
         parent: screen,
         bottom: 0,
         left: 0,
         width: "100%",
         height: 2,
-        style: {
-            bg: "blue",
-            fg: "white"
-        },
+        style: { bg: "blue", fg: "white" },
         tags: true
     });
 
-    const getFormattedTime = (): string => {
-        const d = new Date();
-        const h = d.getHours().toString().padStart(2, "0");
-        const m = d.getMinutes().toString().padStart(2, "0");
-        const s = d.getSeconds().toString().padStart(2, "0");
-        return `${h}:${m}:${s}`;
-    };
-
     const addLog = (tag: string, message: string, color = "white") => {
-        const time = getFormattedTime();
-        logBox.add(`{gray-fg}[${time}]{/} {${color}-fg}[${tag}]{/} ${message}`);
+        logBox.add(`{gray-fg}[${new Date().toTimeString().slice(0, 8)}]{/} {${color}-fg}[${tag}]{/} ${message}`);
+        scheduleRender();
     };
 
     const getIndexingPct = (idx?: { completed: number; total: number }) =>
@@ -144,19 +118,13 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     const renderHeader = () => {
         const state = engine.getState();
-        const role = state.role.toUpperCase();
         const indexingPct = getIndexingPct(state.indexing);
 
         let statusBadge = "{green-bg}{black-fg}{bold} ACTIVE {/}";
-        if (state.isPaused) {
-            statusBadge = "{yellow-bg}{black-fg}{bold} PAUSED {/}";
-        } else if (state.indexing?.isIndexing) {
-            statusBadge = `{cyan-bg}{black-fg}{bold} INDEXING (${indexingPct}%) {/}`;
-        } else if (state.status === "syncing") {
-            statusBadge = "{cyan-bg}{black-fg}{bold} SYNCING {/}";
-        } else if (state.status === "error") {
-            statusBadge = "{red-bg}{white-fg}{bold} ERROR {/}";
-        }
+        if (state.isPaused) statusBadge = "{yellow-bg}{black-fg}{bold} PAUSED {/}";
+        else if (state.indexing?.isIndexing) statusBadge = `{cyan-bg}{black-fg}{bold} INDEXING (${indexingPct}%) {/}`;
+        else if (state.status === "syncing") statusBadge = "{cyan-bg}{black-fg}{bold} SYNCING {/}";
+        else if (state.status === "error") statusBadge = "{red-bg}{white-fg}{bold} ERROR {/}";
 
         let tunnelDisplay = "{gray-fg}Disabled{/}";
         if (state.tunnelState === "online" && state.endpoints.tunnel) {
@@ -172,14 +140,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             : "";
 
         const lines = [
-            `{bold}FlipSync{/} {cyan-fg}${role}{/}  |  Status: ${statusBadge}  |  Tunnel: ${tunnelDisplay}`,
+            `{bold}FlipSync{/} {cyan-fg}${state.role.toUpperCase()}{/}  |  Status: ${statusBadge}  |  Tunnel: ${tunnelDisplay}`,
+            state.serverUrl ? `{bold}Connected Server:{/} {underline}${state.serverUrl}{/}` : "",
             `{bold}Endpoints:{/} Local: {underline}${state.endpoints.local || "N/A"}{/}  |  LAN: {underline}${state.endpoints.lan || "N/A"}{/}  |  Tailscale: ${state.endpoints.tailscale || "N/A"}`,
-            `{bold}Directory:{/} {underline}${state.syncDir}{/}  |  {bold}Files:{/} ${state.stats.totalFiles}${indexingText}  |  {bold}Auth Token:{/} ${state.token ? state.token : "{gray-fg}(Open Access){/}"}`
-        ];
-
-        if (state.serverUrl) {
-            lines.splice(1, 0, `{bold}Connected Server:{/} {underline}${state.serverUrl}{/}`);
-        }
+            `{bold}Directory:{/} {underline}${state.syncDir}{/}  |  {bold}Files:{/} ${state.stats.totalFiles}${indexingText}  |  {bold}Auth Token:{/} ${state.token || "{gray-fg}(Open Access){/}"}`
+        ].filter(Boolean);
 
         headerBox.setContent(lines.join("\n"));
     };
@@ -191,14 +156,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         if (active.length === 0) {
             if (state.indexing?.isIndexing) {
                 const pct = getIndexingPct(state.indexing);
-                const bar = renderProgressBar(pct, 26);
-                const fileDetail = state.indexing.currentFile
-                    ? `  • Current File:       {bold}${state.indexing.currentFile}{/}`
-                    : "";
                 const lines = [
                     `{cyan-fg}{bold}Indexing files: ${state.indexing.completed}/${state.indexing.total} (${pct}%){/}`,
-                    `  ${bar}`,
-                    fileDetail,
+                    `  ${renderProgressBar(pct, 26)}`,
+                    state.indexing.currentFile ? `  • Current File:       {bold}${state.indexing.currentFile}{/}` : "",
                     "",
                     `{bold}Stats Summary:{/}`,
                     `  • Discovered Files:   {bold}${state.stats.totalFiles}{/}`,
@@ -209,7 +170,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
                 return;
             }
 
-            const lines = [
+            transferBox.setContent([
                 `{gray-fg}Engine idle - All queues empty and up to date.{/}`,
                 "",
                 `{bold}Stats Summary:{/}`,
@@ -217,20 +178,19 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
                 `  • Total Data:         {bold}${formatBytes(state.stats.bytesTransferred)}{/}`,
                 `  • Conflicts Detected: ${state.stats.conflictsCount > 0 ? `{magenta-fg}{bold}${state.stats.conflictsCount}{/}` : "0"}`,
                 `  • Errors Encountered: ${state.stats.errorsCount > 0 ? `{red-fg}{bold}${state.stats.errorsCount}{/}` : "0"}`
-            ];
-            transferBox.setContent(lines.join("\n"));
+            ].join("\n"));
             return;
         }
 
         const maxLen = Math.max(30, (screen.width as number) - 6);
+        const half = (maxLen - 3) >> 1;
         const lines: string[] = [];
         for (const t of active.slice(0, 3)) {
-            const bar = renderProgressBar(t.percent, 24);
-            const speed = formatSpeed(t.speedBps);
-            const sizeStr = `${formatBytes(t.transferred)} / ${formatBytes(t.total)}`;
-            const name = t.file.length > maxLen ? `${t.file.slice(0, (maxLen - 3) >> 1)}...${t.file.slice(-((maxLen - 3) >> 1))}` : t.file;
-            lines.push(`{bold}${name}{/}`);
-            lines.push(`  ${bar}  ${sizeStr}  ({cyan-fg}${speed}{/})`);
+            const name = t.file.length > maxLen ? `${t.file.slice(0, half)}...${t.file.slice(-half)}` : t.file;
+            lines.push(
+                `{bold}${name}{/}`,
+                `  ${renderProgressBar(t.percent, 24)}  ${formatBytes(t.transferred)} / ${formatBytes(t.total)}  ({cyan-fg}${formatSpeed(t.speedBps)}{/})`
+            );
         }
 
         if (active.length > 3) {
@@ -242,11 +202,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     const renderFooter = () => {
         const state = engine.getState();
-        let statusText = state.isPaused ? "PAUSED (press p to resume)" : state.status.toUpperCase();
-        if (!state.isPaused && state.indexing?.isIndexing) {
-            const pct = getIndexingPct(state.indexing);
-            statusText = `INDEXING ${state.indexing.completed}/${state.indexing.total} (${pct}%)`;
-        }
+        const statusText = state.isPaused
+            ? "PAUSED (press p to resume)"
+            : state.indexing?.isIndexing
+                ? `INDEXING ${state.indexing.completed}/${state.indexing.total} (${getIndexingPct(state.indexing)}%)`
+                : state.status.toUpperCase();
         footerBox.setContent(
             ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[x]{/} Cancel  {bold}[r]{/} Re-sync  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
         );
@@ -254,12 +214,13 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     let isExiting = false;
     let isPickerOpen = false;
-    let isCommandModalOpen = false;
     let activeCommandModal: { close: () => void } | null = null;
     let renderTimer: NodeJS.Timeout | null = null;
 
+    const isModalOpen = () => isPickerOpen || !!activeCommandModal;
+
     const updateAll = () => {
-        if (isExiting || isPickerOpen || isCommandModalOpen) return;
+        if (isExiting || isModalOpen()) return;
         renderHeader();
         renderTransferPanel();
         renderFooter();
@@ -275,89 +236,34 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     };
 
     // Wire up SyncEngine events to TUI
-    engine.on("scan:discovered", (event: { totalFiles: number }) => {
-        addLog("INDEX", `Discovered ${event.totalFiles} file(s). Progressively indexing in background...`, "cyan");
-        scheduleRender();
+    engine.on("scan:discovered", (e: { totalFiles: number }) =>
+        addLog("INDEX", `Discovered ${e.totalFiles} file(s). Progressively indexing in background...`, "cyan"));
+    engine.on("scan:progress", scheduleRender);
+    engine.on("scan:complete", (e: { totalFiles: number }) =>
+        addLog("INDEX", `Indexing complete. All ${e.totalFiles} file(s) indexed and verified.`, "green"));
+    engine.on("engine:ready", (e: SyncEngineReadyEvent) => {
+        addLog("READY", `Engine initialized. Watching ${e.filesCount} file(s) in ${e.syncDir}`, "green");
+        if (e.tunnelUrl) addLog("TUNNEL", `Cloudflare public tunnel active: ${e.tunnelUrl}`, "cyan");
     });
-
-    engine.on("scan:progress", () => {
-        scheduleRender();
-    });
-
-    engine.on("scan:complete", (event: { totalFiles: number }) => {
-        addLog("INDEX", `Indexing complete. All ${event.totalFiles} file(s) indexed and verified.`, "green");
-        scheduleRender();
-    });
-
-    engine.on("engine:ready", (event: SyncEngineReadyEvent) => {
-        addLog("READY", `Engine initialized. Watching ${event.filesCount} file(s) in ${event.syncDir}`, "green");
-        if (event.tunnelUrl) {
-            addLog("TUNNEL", `Cloudflare public tunnel active: ${event.tunnelUrl}`, "cyan");
-        }
-        scheduleRender();
-    });
-
-    engine.on("sync:start", (event: SyncStartEvent) => {
-        addLog("SYNC", `Batch sync started: ${event.count} file(s)`, "blue");
-        scheduleRender();
-    });
-
-    engine.on("sync:file-progress", (_event: SyncFileProgressEvent) => {
-        scheduleRender();
-    });
-
-    engine.on("sync:file-complete", (event: SyncFileCompleteEvent) => {
-        addLog("COMPLETE", `Synchronized {bold}${event.file}{/} (${event.hash.slice(0, 8)}...)`, "green");
-        scheduleRender();
-    });
-
-    engine.on("sync:file-served", (event: SyncFileServedEvent) => {
-        const kb = (event.size / 1024).toFixed(1);
-        addLog("SERVED", `Sent {bold}${event.file}{/} (${kb} KB) to ${event.clientIp}`, "cyan");
-        scheduleRender();
-    });
-
-    engine.on("sync:conflict", (event: SyncConflictEvent) => {
-        addLog(
-            "CONFLICT",
-            `Conflict on {bold}${event.file}{/}! Local: ${event.localVersion} Remote: ${event.remoteVersion}`,
-            "magenta"
-        );
-        scheduleRender();
-    });
-
-    engine.on("sync:error", (event: SyncErrorEvent) => {
-        const ctx = event.context ? `[${event.context}] ` : "";
-        addLog("ERROR", `${ctx}${event.error.message}`, "red");
-        scheduleRender();
-    });
-
-    engine.on("sync:idle", () => {
-        scheduleRender();
-    });
-
-    engine.on("engine:pause", () => {
-        addLog("PAUSE", "Synchronization paused by user.", "yellow");
-        scheduleRender();
-    });
-
-    engine.on("engine:resume", () => {
-        addLog("RESUME", "Synchronization resumed.", "green");
-        scheduleRender();
-    });
-
-    engine.on("sync:cancelled", () => {
-        addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow");
-        scheduleRender();
-    });
+    engine.on("sync:start", (e: SyncStartEvent) =>
+        addLog("SYNC", `Batch sync started: ${e.count} file(s)`, "blue"));
+    engine.on("sync:file-progress", scheduleRender);
+    engine.on("sync:file-complete", (e: SyncFileCompleteEvent) =>
+        addLog("COMPLETE", `Synchronized {bold}${e.file}{/} (${e.hash.slice(0, 8)}...)`, "green"));
+    engine.on("sync:file-served", (e: SyncFileServedEvent) =>
+        addLog("SERVED", `Sent {bold}${e.file}{/} (${(e.size / 1024).toFixed(1)} KB) to ${e.clientIp}`, "cyan"));
+    engine.on("sync:conflict", (e: SyncConflictEvent) =>
+        addLog("CONFLICT", `Conflict on {bold}${e.file}{/}! Local: ${e.localVersion} Remote: ${e.remoteVersion}`, "magenta"));
+    engine.on("sync:error", (e: SyncErrorEvent) =>
+        addLog("ERROR", `${e.context ? `[${e.context}] ` : ""}${e.error.message}`, "red"));
+    engine.on("sync:idle", scheduleRender);
+    engine.on("engine:pause", () => addLog("PAUSE", "Synchronization paused by user.", "yellow"));
+    engine.on("engine:resume", () => addLog("RESUME", "Synchronization resumed.", "green"));
+    engine.on("sync:cancelled", () => addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow"));
 
     // Keybindings & Shutdown
     const restoreTerminalAndExit = (code: number): void => {
-        try {
-            screen.destroy();
-        } catch {
-            // Ignore
-        }
+        try { screen.destroy(); } catch {}
         process.stdout.write("\x1b[?1049l\x1b[?25h");
         process.exit(code);
     };
@@ -384,13 +290,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     };
 
     const showCommandModal = () => {
-        if (isPickerOpen || isCommandModalOpen) return;
-        isCommandModalOpen = true;
-
+        if (isModalOpen()) return;
         activeCommandModal = openCommandModal(screen, {
             state: engine.getState(),
             onClose: () => {
-                isCommandModalOpen = false;
                 activeCommandModal = null;
                 updateAll();
             }
@@ -398,16 +301,14 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     };
 
     const showFolderSelector = (isInitial = false) => {
-        if (isPickerOpen || isCommandModalOpen) return;
+        if (isModalOpen()) return;
         isPickerOpen = true;
 
         openFolderPicker(
             screen,
             {
                 initialDir: engine.getSyncDir(),
-                title: isInitial
-                    ? "Select Folder to Synchronize"
-                    : "Change Synchronization Directory"
+                title: isInitial ? "Select Folder to Synchronize" : "Change Synchronization Directory"
             },
             async (chosenDir: string) => {
                 isPickerOpen = false;
@@ -416,56 +317,44 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
                     await engine.start();
                     addLog("FOLDER", `Sync directory set to: {underline}${chosenDir}{/}`, "cyan");
                     updateAll();
-                } catch (err: unknown) {
-                    const error = err instanceof Error ? err : new Error(String(err));
-                    addLog("ERROR", `Failed to set folder: ${error.message}`, "red");
+                } catch (err) {
+                    addLog("ERROR", `Failed to set folder: ${err instanceof Error ? err.message : String(err)}`, "red");
                 }
             },
             () => {
                 isPickerOpen = false;
-                if (isInitial) {
-                    cleanExit(0);
-                } else {
-                    updateAll();
-                }
+                if (isInitial) cleanExit(0);
+                else updateAll();
             }
         );
     };
 
     screen.key(["c", "C"], () => {
         if (isPickerOpen) return;
-        if (isCommandModalOpen) {
-            activeCommandModal?.close();
-        } else {
-            showCommandModal();
-        }
+        if (activeCommandModal) activeCommandModal.close();
+        else showCommandModal();
     });
 
     screen.key(["C-c"], () => cleanExit(0));
 
     screen.key(["q", "Q"], () => {
-        if (isCommandModalOpen) {
-            activeCommandModal?.close();
-            return;
-        }
-        if (!isPickerOpen) {
-            cleanExit(0);
-        }
+        if (activeCommandModal) activeCommandModal.close();
+        else if (!isPickerOpen) cleanExit(0);
     });
 
     screen.key(["x", "X"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) engine.cancelTransfers();
+        if (!isModalOpen()) engine.cancelTransfers();
     });
 
     screen.key(["p", "P"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
+        if (!isModalOpen()) {
             engine.togglePause();
             updateAll();
         }
     });
 
     screen.key(["r", "R"], async () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
+        if (!isModalOpen()) {
             addLog("REHASH", "Forcing full directory re-hash...", "cyan");
             updateAll();
             await engine.forceRehash();
@@ -475,38 +364,19 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     });
 
     screen.key(["f", "F"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
-            showFolderSelector(false);
-        }
+        if (!isModalOpen()) showFolderSelector(false);
     });
 
-    screen.key(["up", "k"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
-            logBox.scroll(-1);
+    const scrollLog = (lines: number) => {
+        if (!isModalOpen()) {
+            logBox.scroll(lines);
             screen.render();
         }
-    });
-
-    screen.key(["down", "j"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
-            logBox.scroll(1);
-            screen.render();
-        }
-    });
-
-    screen.key(["pageup"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
-            logBox.scroll(-5);
-            screen.render();
-        }
-    });
-
-    screen.key(["pagedown"], () => {
-        if (!isPickerOpen && !isCommandModalOpen) {
-            logBox.scroll(5);
-            screen.render();
-        }
-    });
+    };
+    screen.key(["up", "k"], () => scrollLog(-1));
+    screen.key(["down", "j"], () => scrollLog(1));
+    screen.key(["pageup"], () => scrollLog(-5));
+    screen.key(["pagedown"], () => scrollLog(5));
 
     // Handle OS signals
     process.on("SIGINT", () => cleanExit(0));
@@ -514,9 +384,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     // Periodic UI refresh for speed calculations and clock
     const renderInterval = setInterval(() => {
-        if (!isExiting && !isPickerOpen && !isCommandModalOpen) {
-            updateAll();
-        }
+        if (!isExiting && !isModalOpen()) updateAll();
     }, 500);
 
     // Initial render
@@ -530,8 +398,6 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     }
 
     return {
-        stop: async () => {
-            await cleanExit(0);
-        }
+        stop: () => cleanExit(0)
     };
 }
