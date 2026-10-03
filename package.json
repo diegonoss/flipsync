@@ -1,10 +1,16 @@
 {
   "name": "flipsync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-friction real-time file synchronization across networks via Cloudflare Tunnels, Tailscale, or LAN",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "bin": {
     "flipsync": "dist/bin/flipsync.js",
     "flipsync-host": "dist/bin/flipsync-host.js",
@@ -18,6 +24,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.js",
+    "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx tests/run.ts",
     "test:unit": "tsx tests/run.ts",
@@ -25,6 +32,14 @@
     "client": "tsx bin/flipsync-client.ts",
     "start": "tsx bin/flipsync.ts"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/diegonoss/flipsync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/diegonoss/flipsync/issues"
+  },
+  "homepage": "https://github.com/diegonoss/flipsync#readme",
   "keywords": [
     "sync",
     "file-sync",
@@ -47,7 +62,6 @@
   "dependencies": {
     "blessed": "^0.1.81",
     "chokidar": "^5.0.0",
-    "commander": "^15.0.0",
-    "flipsync": "link:"
+    "commander": "^15.0.0"
   }
 }

@@ -20,9 +20,6 @@ importers:
       commander:
         specifier: ^15.0.0
         version: 15.0.0
-      flipsync:
-        specifier: 'link:'
-        version: 'link:'
     devDependencies:
       '@types/blessed':
         specifier: ^0.1.27

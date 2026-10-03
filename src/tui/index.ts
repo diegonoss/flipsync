@@ -132,7 +132,8 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         } else if (state.tunnelState === "connecting") {
             tunnelDisplay = "{yellow-fg}○ Connecting...{/}";
         } else if (state.tunnelState === "error") {
-            tunnelDisplay = "{red-fg}✕ Error{/}";
+            const shortErr = state.tunnelError ? ` (${state.tunnelError.split("\n")[0].slice(0, 45)})` : "";
+            tunnelDisplay = `{red-fg}✕ Error${shortErr}{/}`;
         }
 
         const indexingText = state.indexing?.isIndexing
@@ -254,8 +255,13 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         addLog("SERVED", `Sent {bold}${e.file}{/} (${(e.size / 1024).toFixed(1)} KB) to ${e.clientIp}`, "cyan"));
     engine.on("sync:conflict", (e: SyncConflictEvent) =>
         addLog("CONFLICT", `Conflict on {bold}${e.file}{/}! Local: ${e.localVersion} Remote: ${e.remoteVersion}`, "magenta"));
-    engine.on("sync:error", (e: SyncErrorEvent) =>
-        addLog("ERROR", `${e.context ? `[${e.context}] ` : ""}${e.error.message}`, "red"));
+    engine.on("sync:error", (e: SyncErrorEvent) => {
+        const tag = e.context?.startsWith("tunnel") ? "TUNNEL" : "ERROR";
+        const lines = e.error.message.split("\n");
+        for (const line of lines) {
+            addLog(tag, `${e.context ? `[${e.context}] ` : ""}${line}`, "red");
+        }
+    });
     engine.on("sync:idle", scheduleRender);
     engine.on("engine:pause", () => addLog("PAUSE", "Synchronization paused by user.", "yellow"));
     engine.on("engine:resume", () => addLog("RESUME", "Synchronization resumed.", "green"));

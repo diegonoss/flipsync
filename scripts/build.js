@@ -39,6 +39,8 @@ async function build() {
     console.log("[BUILD] Emitting TypeScript type definitions...");
     try {
         execSync("npx tsc --emitDeclarationOnly --outDir dist", { stdio: "inherit" });
+        fs.writeFileSync("dist/index.d.ts", 'export * from "./src/index.js";\n');
+        fs.rmSync("dist/tests", { recursive: true, force: true });
     } catch {
         console.warn("[BUILD] [WARN] Declaration emit encountered warnings, continuing...");
     }

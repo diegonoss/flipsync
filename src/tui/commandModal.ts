@@ -221,10 +221,18 @@ export function openCommandModal(
             ? `{green-fg}${state.token}{/}`
             : `{gray-fg}(Open Access — No Token){/}`;
 
+        let tunnelNotice = "";
+        if (state.tunnelState === "error" && state.tunnelError) {
+            tunnelNotice = `{red-fg}⚠ Public Tunnel unavailable: ${state.tunnelError.split("\n")[0]}{/}`;
+        } else if (state.tunnelState === "disabled") {
+            tunnelNotice = `{gray-fg}ℹ Public Tunnel disabled (start with --tunnel to enable public internet access){/}`;
+        }
+
         const lines = [
             `{bold}{cyan-fg}Run directly on client PC without downloading/installing packages:{/}`,
             `{bold}Server URL:{/} {underline}${current.url}{/} {yellow-fg}[${current.label}]{/}${cycleHint}`,
             `{bold}Auth Token:{/} ${tokenDisplay}`,
+            ...(tunnelNotice ? [tunnelNotice] : []),
             "",
             `{bold}{yellow-fg}▶ Option 1: Windows PowerShell (Zero Install){/}`,
             `  {white-fg}${cmds.powershell}{/}`,

@@ -35,7 +35,14 @@ export function isCommandAvailable(cmd: string): boolean {
 
 export function findCloudflaredBinary(): string | null {
     if (isCommandAvailable("cloudflared")) return "cloudflared";
-    return [path.resolve(".bin/cloudflared"), path.resolve(".bin/cloudflared.exe")].find((p) => fs.existsSync(p)) ?? null;
+    const exeName = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+    const candidates = [
+        path.join(os.homedir(), ".flipsync", "bin", exeName),
+        path.resolve(".bin", exeName),
+        path.resolve(".bin/cloudflared"),
+        path.resolve(".bin/cloudflared.exe")
+    ];
+    return candidates.find((p) => fs.existsSync(p)) ?? null;
 }
 
 export async function startCloudflareTunnel(localPort: number, binaryPath?: string): Promise<TunnelResult> {
@@ -44,6 +51,15 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
         const proc = spawn(bin, ["tunnel", "--url", `http://127.0.0.1:${localPort}`], {
             stdio: ["ignore", "pipe", "pipe"]
         });
+
+        const recentLogs: string[] = [];
+        const captureLog = (chunk: Buffer) => {
+            const lines = chunk.toString().split(/\r?\n/).filter(Boolean);
+            for (const line of lines) {
+                recentLogs.push(line);
+                if (recentLogs.length > 20) recentLogs.shift();
+            }
+        };
 
         let settled = false;
         const fail = (err: Error) => {
@@ -56,10 +72,12 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
 
         const timeout = setTimeout(() => {
             proc.kill();
-            fail(new Error("Cloudflare tunnel timed out waiting for public URL (30s)"));
+            const details = recentLogs.length > 0 ? `\nRecent logs:\n${recentLogs.slice(-5).join("\n")}` : "";
+            fail(new Error(`Cloudflare tunnel timed out waiting for public URL (30s).${details}`));
         }, 30000);
 
         const onOutput = async (data: Buffer): Promise<void> => {
+            captureLog(data);
             const match = data.toString().match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
             if (match && !settled) {
                 settled = true;
@@ -72,7 +90,8 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
                     const probe = await fetch(`${publicUrl}/api/status`, {
                         signal: AbortSignal.timeout(2000)
                     }).catch(() => null);
-                    if (probe?.status === 200) break;
+                    // 200 (unauthenticated status) or 401 (authenticated server active) verifies reachability
+                    if (probe && (probe.status === 200 || probe.status === 401)) break;
                     await new Promise((r) => setTimeout(r, 1000));
                 }
 
@@ -93,8 +112,13 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
 
         proc.stdout.on("data", onOutput);
         proc.stderr.on("data", onOutput);
-        proc.on("error", fail);
-        proc.on("exit", (code) => fail(new Error(`cloudflared exited early with code ${code}`)));
+        proc.on("error", (err) => {
+            fail(new Error(`Failed to execute cloudflared binary '${bin}': ${err.message}`));
+        });
+        proc.on("exit", (code) => {
+            const errorDetails = recentLogs.length > 0 ? `: ${recentLogs.slice(-3).join(" ").trim()}` : "";
+            fail(new Error(`cloudflared exited early with code ${code}${errorDetails}`));
+        });
     });
 }
 
@@ -105,10 +129,11 @@ export function getCloudflaredDownloadUrl(): string {
     return `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${osName}-${archName}${ext}`;
 }
 
-export async function downloadCloudflaredBinary(): Promise<string> {
+export async function downloadCloudflaredBinary(destinationPath?: string): Promise<string> {
     const isWin = process.platform === "win32";
-    const targetPath = path.resolve(`.bin/cloudflared${isWin ? ".exe" : ""}`);
-    const tempPath = `${targetPath}.tmp`;
+    const exeName = isWin ? "cloudflared.exe" : "cloudflared";
+    const targetPath = destinationPath || path.join(os.homedir(), ".flipsync", "bin", exeName);
+    const tempPath = `${targetPath}.tmp.${Date.now()}`;
     const url = getCloudflaredDownloadUrl();
 
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
@@ -127,15 +152,21 @@ export async function downloadCloudflaredBinary(): Promise<string> {
 }
 
 export async function startAutoTunnel(localPort: number): Promise<TunnelResult> {
-    const bin = findCloudflaredBinary();
+    let bin = findCloudflaredBinary();
     if (!bin) {
-        throw new Error(
-            "cloudflared binary not found. To use Cloudflare Tunnels safely, please install cloudflared via your package manager:\n" +
-            "  - macOS: brew install cloudflared\n" +
-            "  - Windows: winget install Cloudflare.cloudflared\n" +
-            "  - Linux: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n" +
-            "Or place a verified cloudflared binary in your PATH."
-        );
+        try {
+            bin = await downloadCloudflaredBinary();
+        } catch (downloadErr: unknown) {
+            const downloadMsg = downloadErr instanceof Error ? downloadErr.message : String(downloadErr);
+            throw new Error(
+                `cloudflared binary not found and auto-download failed (${downloadMsg}).\n` +
+                "Please install cloudflared manually:\n" +
+                "  - macOS: brew install cloudflared\n" +
+                "  - Windows: winget install Cloudflare.cloudflared\n" +
+                "  - Linux: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n" +
+                "Or place a verified cloudflared binary in ~/.flipsync/bin/ or in your PATH."
+            );
+        }
     }
     return startCloudflareTunnel(localPort, bin);
 }

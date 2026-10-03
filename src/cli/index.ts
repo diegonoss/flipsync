@@ -51,6 +51,7 @@ export async function runHeadlessCli(
                 lanUrl: event.lanUrl,
                 tailscaleIp: event.tailscaleIp,
                 tunnelUrl: event.tunnelUrl,
+                tunnelError: event.tunnelError,
                 token: event.token ? "present" : "none"
             }));
         } else {
@@ -70,6 +71,9 @@ export async function runHeadlessCli(
             }
             if (event.tunnelUrl) {
                 logOut(`  Public URL: ${event.tunnelUrl}`);
+            } else if (event.tunnelError) {
+                const shortErr = event.tunnelError.split("\n")[0];
+                logOut(`  Public URL: [FAILED] ${shortErr}`);
             }
             if (event.serverUrl) {
                 logOut(`  Connected:  ${event.serverUrl}`);

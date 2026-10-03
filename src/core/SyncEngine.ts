@@ -81,6 +81,7 @@ export interface SyncEngineReadyEvent {
     lanUrl?: string | null;
     tailscaleIp?: string | null;
     tunnelUrl?: string | null;
+    tunnelError?: string;
     activeUrl?: string;
     endpoints: string[];
     token?: string;
@@ -111,6 +112,7 @@ export interface SyncEngineState {
         active?: string;
     };
     tunnelState: "disabled" | "connecting" | "online" | "error";
+    tunnelError?: string;
     token?: string;
     serverUrl?: string;
     stats: {
@@ -163,6 +165,7 @@ export class SyncEngine extends EventEmitter {
     private tailscaleIp?: string | null;
     private tunnelUrl?: string | null;
     private tunnelState: "disabled" | "connecting" | "online" | "error" = "disabled";
+    private tunnelError?: string;
 
     // Client components
     private currentSseReq: http.ClientRequest | null = null;
@@ -432,6 +435,7 @@ export class SyncEngine extends EventEmitter {
                 active: activeUrl
             },
             tunnelState: this.tunnelState,
+            tunnelError: this.tunnelError,
             token: this.token,
             serverUrl: this.serverUrl,
             indexing: this.indexingState.isIndexing ? { ...this.indexingState } : undefined,
@@ -689,6 +693,7 @@ export class SyncEngine extends EventEmitter {
         // 2. Optional Tunnel
         if (this.enableTunnel) {
             this.tunnelState = "connecting";
+            this.tunnelError = undefined;
             try {
                 this.tunnelResult = await startAutoTunnel(this.port);
                 this.tunnelUrl = this.tunnelResult.url;
@@ -700,9 +705,22 @@ export class SyncEngine extends EventEmitter {
                         // Ignore
                     }
                 }
+                if (this.tunnelResult.process) {
+                    this.tunnelResult.process.on("exit", (code) => {
+                        if (this.isRunning && this.tunnelState === "online") {
+                            this.tunnelState = "error";
+                            this.tunnelError = `cloudflared exited unexpectedly with code ${code}`;
+                            this.emit("sync:error", {
+                                error: new Error(this.tunnelError),
+                                context: "tunnel:runtime"
+                            });
+                        }
+                    });
+                }
             } catch (err: unknown) {
                 this.tunnelState = "error";
                 const error = err instanceof Error ? err : new Error(String(err));
+                this.tunnelError = error.message;
                 this.stats.errorsCount++;
                 this.emit("sync:error", { error, context: "tunnel:start" });
             }
@@ -724,6 +742,7 @@ export class SyncEngine extends EventEmitter {
             lanUrl: this.lanUrl,
             tailscaleIp: this.tailscaleIp,
             tunnelUrl: this.tunnelUrl,
+            tunnelError: this.tunnelError,
             activeUrl: this.tunnelUrl || this.lanUrl || this.localUrl,
             endpoints: endpointsList,
             token: this.token
