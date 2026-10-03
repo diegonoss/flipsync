@@ -38,7 +38,8 @@ async function build() {
 
     console.log("[BUILD] Emitting TypeScript type definitions...");
     try {
-        execSync("npx tsc --emitDeclarationOnly --outDir dist", { stdio: "inherit" });
+        const tscScript = path.resolve("node_modules/typescript/bin/tsc");
+        execSync(`"${process.execPath}" "${tscScript}" --emitDeclarationOnly --outDir dist`, { stdio: "inherit" });
         fs.writeFileSync("dist/index.d.ts", 'export * from "./src/index.js";\n');
         fs.rmSync("dist/tests", { recursive: true, force: true });
     } catch {
@@ -68,7 +69,7 @@ async function build() {
     for (const bin of binaries) {
         if (fs.existsSync(bin)) {
             try {
-                fs.chmodSync(bin, 0o755);
+                fs.chmodSync(bin, 0o750);
             } catch {
                 // Ignore on non-posix systems
             }

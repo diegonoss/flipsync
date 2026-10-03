@@ -257,9 +257,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         addLog("CONFLICT", `Conflict on {bold}${e.file}{/}! Local: ${e.localVersion} Remote: ${e.remoteVersion}`, "magenta"));
     engine.on("sync:error", (e: SyncErrorEvent) => {
         const tag = e.context?.startsWith("tunnel") ? "TUNNEL" : "ERROR";
+        const prefix = e.context ? `[${e.context}] ` : "";
         const lines = e.error.message.split("\n");
         for (const line of lines) {
-            addLog(tag, `${e.context ? `[${e.context}] ` : ""}${line}`, "red");
+            addLog(tag, `${prefix}${line}`, "red");
         }
     });
     engine.on("sync:idle", scheduleRender);

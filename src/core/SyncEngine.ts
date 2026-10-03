@@ -201,7 +201,13 @@ export class SyncEngine extends EventEmitter {
         this.role = role;
 
         const rawDir = options.syncDir ?? options.dir ?? options.targetDir ?? ".";
-        this.syncDir = path.resolve(rawDir);
+        const normalized = path.normalize(rawDir);
+        const resolved = path.resolve(normalized);
+        const baseDir = path.dirname(resolved);
+        if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
+            throw new Error(`Invalid sync directory path: ${rawDir}`);
+        }
+        this.syncDir = resolved;
 
         this.host = options.host ?? process.env.SYNC_HOST ?? "0.0.0.0";
         this.port = options.port ?? parseInt(process.env.SYNC_PORT || "7890", 10);
@@ -210,10 +216,21 @@ export class SyncEngine extends EventEmitter {
         this.scriptsDir = options.scriptsDir;
         this.syncOnce = options.once ?? false;
 
+        const allowedProtocols = ["http:", "https:"];
         if (options.serverUrl) {
-            this.serverUrl = options.serverUrl.replace(/\/+$/, "");
+            const raw = options.serverUrl.replace(/\/+$/, "");
+            const parsed = new URL(raw);
+            if (!allowedProtocols.includes(parsed.protocol)) {
+                throw new Error(`Invalid serverUrl protocol: ${parsed.protocol}`);
+            }
+            this.serverUrl = raw;
         } else if (process.env.SYNC_SERVER) {
-            this.serverUrl = process.env.SYNC_SERVER.replace(/\/+$/, "");
+            const raw = process.env.SYNC_SERVER.replace(/\/+$/, "");
+            const parsed = new URL(raw);
+            if (!allowedProtocols.includes(parsed.protocol)) {
+                throw new Error(`Invalid SYNC_SERVER protocol: ${parsed.protocol}`);
+            }
+            this.serverUrl = raw;
         }
 
         // Token resolution
@@ -250,7 +267,11 @@ export class SyncEngine extends EventEmitter {
 
         if (!fs.existsSync(this.syncDir)) {
             try {
-                fs.mkdirSync(this.syncDir, { recursive: true });
+                const canonicalDir = path.resolve(this.syncDir);
+                const parentDir = path.dirname(canonicalDir);
+                if (canonicalDir === parentDir || canonicalDir.startsWith(parentDir + path.sep)) {
+                    fs.mkdirSync(canonicalDir, { recursive: true });
+                }
             } catch (err: unknown) {
                 const error = err instanceof Error ? err : new Error(String(err));
                 this.emit("sync:error", { error, context: "fs:mkdir" });
@@ -832,9 +853,13 @@ export class SyncEngine extends EventEmitter {
     private async scanLocalTargetDir(): Promise<void> {
         const scanDir = async (dir: string, relPrefix = ""): Promise<void> => {
             if (!this.isRunning) return;
+            const canonicalDir = path.resolve(dir);
+            if (canonicalDir !== this.syncDir && !canonicalDir.startsWith(this.syncDir + path.sep)) {
+                return;
+            }
             let entries: fs.Dirent[];
             try {
-                entries = await fs.promises.readdir(dir, { withFileTypes: true });
+                entries = await fs.promises.readdir(canonicalDir, { withFileTypes: true });
             } catch {
                 return;
             }
@@ -842,7 +867,7 @@ export class SyncEngine extends EventEmitter {
                 if (!this.isRunning) return;
                 if (isIgnored(entry.name)) continue;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
-                const full = path.join(dir, entry.name);
+                const full = path.join(canonicalDir, entry.name);
                 if (entry.isDirectory()) {
                     await scanDir(full, rel);
                 } else if (entry.isFile()) {
@@ -1107,7 +1132,12 @@ export class SyncEngine extends EventEmitter {
             return;
         }
 
+        const schemesList = ["http:", "https:"];
         const parsed = new URL(this.url("/api/events"));
+        if (!schemesList.includes(parsed.protocol)) {
+            this.failFatal(`Disallowed protocol for events: ${parsed.protocol}`, "connect:protocol");
+            return;
+        }
         const transport = parsed.protocol === "https:" ? https : http;
 
         const req = transport.request(
@@ -1239,7 +1269,11 @@ export class SyncEngine extends EventEmitter {
 
     private httpRequest(urlStr: string): Promise<{ statusCode: number; body: string }> {
         return new Promise((resolve, reject) => {
+            const schemesList = ["http:", "https:"];
             const parsed = new URL(urlStr);
+            if (!schemesList.includes(parsed.protocol)) {
+                return reject(new Error(`Disallowed protocol: ${parsed.protocol}`));
+            }
             const isHttps = parsed.protocol === "https:";
             const transport = isHttps ? https : http;
 

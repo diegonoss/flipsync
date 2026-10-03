@@ -17,7 +17,19 @@ export function getLocalLanIp(): string | null {
 
 export function detectTailscaleIp(): string | null {
     try {
-        const out = execSync("tailscale ip -4", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+        const isWin = process.platform === "win32";
+        const candidates = isWin
+            ? ["C:\\Program Files\\Tailscale\\tailscale.exe", "tailscale.exe"]
+            : ["/usr/bin/tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "tailscale"];
+        const tailscaleBin = candidates.find((p) => p.includes(path.sep) ? fs.existsSync(p) : false) ?? "tailscale";
+        const safePath = isWin
+            ? "C:\\Windows\\System32;C:\\Program Files\\Tailscale"
+            : "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        const out = execSync(`"${tailscaleBin}" ip -4`, {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            env: { ...process.env, PATH: safePath }
+        }).trim();
         return /^\d+\.\d+\.\d+\.\d+$/.test(out) ? out : null;
     } catch {
         return null;
@@ -140,9 +152,9 @@ export async function downloadCloudflaredBinary(destinationPath?: string): Promi
     try {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        fs.writeFileSync(tempPath, Buffer.from(await res.arrayBuffer()), { mode: 0o755 });
+        fs.writeFileSync(tempPath, Buffer.from(await res.arrayBuffer()), { mode: 0o700 });
         fs.renameSync(tempPath, targetPath);
-        if (!isWin) fs.chmodSync(targetPath, 0o755);
+        if (!isWin) fs.chmodSync(targetPath, 0o700);
         return targetPath;
     } catch (err: unknown) {
         try { fs.unlinkSync(tempPath); } catch {}

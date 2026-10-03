@@ -1,4 +1,5 @@
 import blessed from "blessed";
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import type { SyncEngineState } from "../core/SyncEngine.js";
 
@@ -57,8 +58,11 @@ export async function copyToClipboard(text: string): Promise<boolean> {
             proc.on("error", () => {
                 if (platform === "linux" && cmd === "wl-copy") {
                     try {
-                        const fallbackProc = spawn("xclip", ["-selection", "clipboard"], {
-                            stdio: ["pipe", "ignore", "ignore"]
+                        const xclipCandidates = ["/usr/bin/xclip", "/usr/local/bin/xclip"];
+                        const xclipBin = xclipCandidates.find((p) => fs.existsSync(p)) ?? "xclip";
+                        const fallbackProc = spawn(xclipBin, ["-selection", "clipboard"], {
+                            stdio: ["pipe", "ignore", "ignore"],
+                            env: { ...process.env, PATH: "/usr/local/bin:/usr/bin:/bin" }
                         });
                         fallbackProc.on("error", () => {
                             clearTimeout(timer);
