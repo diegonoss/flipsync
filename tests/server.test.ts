@@ -184,7 +184,13 @@ export async function testServer(): Promise<void> {
                 assert.ok((await extSh.text()).includes("FlipSync"));
             } finally {
                 hostChild.kill();
-                fs.rmSync(externalDir, { recursive: true, force: true });
+                if (hostChild.exitCode === null) {
+                    await new Promise((resolve) => {
+                        hostChild.once("exit", resolve);
+                        setTimeout(resolve, 500);
+                    });
+                }
+                fs.rmSync(externalDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             }
         }
 
