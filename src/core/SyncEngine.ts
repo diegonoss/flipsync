@@ -246,6 +246,21 @@ export class SyncEngine extends EventEmitter {
         }
     }
 
+    private static isForbiddenHost(hostname: string): boolean {
+        if (hostname === "metadata.google.internal") {
+            return true;
+        }
+        const octets = hostname.split(".").map(Number);
+        if (octets.length === 4 && octets.every((n) => !Number.isNaN(n))) {
+            const isLinkLocal = octets[0] === 169 && octets[1] === 254;
+            const isCarrierGradeOrMetadata = octets[0] === 100 && octets[1] === 100 && octets[2] === 100 && octets[3] === 200;
+            if (isLinkLocal || isCarrierGradeOrMetadata) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static sanitizeServerUrl(rawUrl: string): string {
         let clean = rawUrl.trim();
         while (clean.endsWith("/")) {
@@ -257,8 +272,7 @@ export class SyncEngine extends EventEmitter {
             throw new Error(`Invalid serverUrl protocol: ${parsed.protocol}`);
         }
         const hostname = parsed.hostname.toLowerCase();
-        const blockedHosts = new Set(["169.254.169.254", "metadata.google.internal", "100.100.100.200"]);
-        if (blockedHosts.has(hostname) || parsed.username || parsed.password) {
+        if (SyncEngine.isForbiddenHost(hostname) || parsed.username || parsed.password) {
             throw new Error(`Forbidden serverUrl target: ${parsed.hostname}`);
         }
         return clean;
@@ -851,14 +865,6 @@ export class SyncEngine extends EventEmitter {
     }
 
     private async scanLocalTargetDir(): Promise<void> {
-        const processFile = async (fullPath: string, relPath: string): Promise<void> => {
-            const meta = await computeFileHash(fullPath);
-            if (meta) {
-                this.syncedHashes.set(relPath, meta.sha256);
-            }
-            await setImmediate();
-        };
-
         const scanDir = async (dir: string, relPrefix = ""): Promise<void> => {
             if (!this.isRunning) return;
             let entries: fs.Dirent[];
@@ -867,16 +873,20 @@ export class SyncEngine extends EventEmitter {
             } catch {
                 return;
             }
-            for (const entry of entries) {
-                if (!this.isRunning || isIgnored(entry.name)) continue;
+            const tasks = entries.map(async (entry) => {
+                if (!this.isRunning || isIgnored(entry.name)) return;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
                 const full = path.join(dir, entry.name);
                 if (entry.isDirectory()) {
                     await scanDir(full, rel);
                 } else if (entry.isFile()) {
-                    await processFile(full, rel);
+                    const meta = await computeFileHash(full);
+                    if (meta) {
+                        this.syncedHashes.set(rel, meta.sha256);
+                    }
                 }
-            }
+            });
+            await Promise.all(tasks);
         };
 
         await scanDir(this.syncDir);
