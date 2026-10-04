@@ -98,14 +98,7 @@ jobs:
         run: pnpm run build
 
       - name: Publish to npm
-        run: |
-          CURRENT_VERSION=$(node -p "require('./package.json').version")
-          if npm view flipsync@"$CURRENT_VERSION" version >/dev/null 2>&1; then
-            echo "Version $CURRENT_VERSION is already published to npm. Skipping deployment."
-          else
-            echo "Publishing version $CURRENT_VERSION to npm..."
-            pnpm publish --access public --no-git-checks
-          fi
+        run: node scripts/publish.js
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || secrets.NODE_AUTH_TOKEN }}
 
