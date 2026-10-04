@@ -201,36 +201,22 @@ export class SyncEngine extends EventEmitter {
         this.role = role;
 
         const rawDir = options.syncDir ?? options.dir ?? options.targetDir ?? ".";
-        const normalized = path.normalize(rawDir);
-        const resolved = path.resolve(normalized);
-        const baseDir = path.dirname(resolved);
-        if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
+        if (rawDir.includes("\0")) {
             throw new Error(`Invalid sync directory path: ${rawDir}`);
         }
-        this.syncDir = resolved;
+        this.syncDir = path.resolve(rawDir);
 
         this.host = options.host ?? process.env.SYNC_HOST ?? "0.0.0.0";
-        this.port = options.port ?? parseInt(process.env.SYNC_PORT || "7890", 10);
+        this.port = options.port ?? Number.parseInt(process.env.SYNC_PORT || "7890", 10);
         this.enableTunnel = options.tunnel ?? (process.env.SYNC_TUNNEL === "true");
         this.debounceMs = options.debounceMs ?? 150;
         this.scriptsDir = options.scriptsDir;
         this.syncOnce = options.once ?? false;
 
-        const allowedProtocols = ["http:", "https:"];
         if (options.serverUrl) {
-            const raw = options.serverUrl.replace(/\/+$/, "");
-            const parsed = new URL(raw);
-            if (!allowedProtocols.includes(parsed.protocol)) {
-                throw new Error(`Invalid serverUrl protocol: ${parsed.protocol}`);
-            }
-            this.serverUrl = raw;
+            this.serverUrl = SyncEngine.sanitizeServerUrl(options.serverUrl);
         } else if (process.env.SYNC_SERVER) {
-            const raw = process.env.SYNC_SERVER.replace(/\/+$/, "");
-            const parsed = new URL(raw);
-            if (!allowedProtocols.includes(parsed.protocol)) {
-                throw new Error(`Invalid SYNC_SERVER protocol: ${parsed.protocol}`);
-            }
-            this.serverUrl = raw;
+            this.serverUrl = SyncEngine.sanitizeServerUrl(process.env.SYNC_SERVER);
         }
 
         // Token resolution
@@ -260,6 +246,24 @@ export class SyncEngine extends EventEmitter {
         }
     }
 
+    private static sanitizeServerUrl(rawUrl: string): string {
+        let clean = rawUrl.trim();
+        while (clean.endsWith("/")) {
+            clean = clean.slice(0, -1);
+        }
+        const parsed = new URL(clean);
+        const allowedProtocols = new Set(["http:", "https:"]);
+        if (!allowedProtocols.has(parsed.protocol)) {
+            throw new Error(`Invalid serverUrl protocol: ${parsed.protocol}`);
+        }
+        const hostname = parsed.hostname.toLowerCase();
+        const blockedHosts = new Set(["169.254.169.254", "metadata.google.internal", "100.100.100.200"]);
+        if (blockedHosts.has(hostname) || parsed.username || parsed.password) {
+            throw new Error(`Forbidden serverUrl target: ${parsed.hostname}`);
+        }
+        return clean;
+    }
+
     public async start(): Promise<void> {
         if (this.isRunning) return;
         this.isRunning = true;
@@ -267,11 +271,7 @@ export class SyncEngine extends EventEmitter {
 
         if (!fs.existsSync(this.syncDir)) {
             try {
-                const canonicalDir = path.resolve(this.syncDir);
-                const parentDir = path.dirname(canonicalDir);
-                if (canonicalDir === parentDir || canonicalDir.startsWith(parentDir + path.sep)) {
-                    fs.mkdirSync(canonicalDir, { recursive: true });
-                }
+                fs.mkdirSync(this.syncDir, { recursive: true });
             } catch (err: unknown) {
                 const error = err instanceof Error ? err : new Error(String(err));
                 this.emit("sync:error", { error, context: "fs:mkdir" });
@@ -851,31 +851,30 @@ export class SyncEngine extends EventEmitter {
     }
 
     private async scanLocalTargetDir(): Promise<void> {
+        const processFile = async (fullPath: string, relPath: string): Promise<void> => {
+            const meta = await computeFileHash(fullPath);
+            if (meta) {
+                this.syncedHashes.set(relPath, meta.sha256);
+            }
+            await setImmediate();
+        };
+
         const scanDir = async (dir: string, relPrefix = ""): Promise<void> => {
             if (!this.isRunning) return;
-            const canonicalDir = path.resolve(dir);
-            if (canonicalDir !== this.syncDir && !canonicalDir.startsWith(this.syncDir + path.sep)) {
-                return;
-            }
             let entries: fs.Dirent[];
             try {
-                entries = await fs.promises.readdir(canonicalDir, { withFileTypes: true });
+                entries = await fs.promises.readdir(dir, { withFileTypes: true });
             } catch {
                 return;
             }
             for (const entry of entries) {
-                if (!this.isRunning) return;
-                if (isIgnored(entry.name)) continue;
+                if (!this.isRunning || isIgnored(entry.name)) continue;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
-                const full = path.join(canonicalDir, entry.name);
+                const full = path.join(dir, entry.name);
                 if (entry.isDirectory()) {
                     await scanDir(full, rel);
                 } else if (entry.isFile()) {
-                    const meta = await computeFileHash(full);
-                    if (meta) {
-                        this.syncedHashes.set(rel, meta.sha256);
-                    }
-                    await setImmediate();
+                    await processFile(full, rel);
                 }
             }
         };
@@ -1039,7 +1038,7 @@ export class SyncEngine extends EventEmitter {
                         return reject(new Error(`Download failed with status ${res.statusCode}`));
                     }
 
-                    const total = parseInt(res.headers["content-length"] || "0", 10) || file.size;
+                    const total = Number.parseInt(res.headers["content-length"] || "0", 10) || file.size;
                     transferInfo.total = total;
 
                     const hasher = crypto.createHash("sha256");
@@ -1132,9 +1131,9 @@ export class SyncEngine extends EventEmitter {
             return;
         }
 
-        const schemesList = ["http:", "https:"];
+        const schemesList = new Set(["http:", "https:"]);
         const parsed = new URL(this.url("/api/events"));
-        if (!schemesList.includes(parsed.protocol)) {
+        if (!schemesList.has(parsed.protocol)) {
             this.failFatal(`Disallowed protocol for events: ${parsed.protocol}`, "connect:protocol");
             return;
         }
@@ -1269,9 +1268,9 @@ export class SyncEngine extends EventEmitter {
 
     private httpRequest(urlStr: string): Promise<{ statusCode: number; body: string }> {
         return new Promise((resolve, reject) => {
-            const schemesList = ["http:", "https:"];
+            const schemesList = new Set(["http:", "https:"]);
             const parsed = new URL(urlStr);
-            if (!schemesList.includes(parsed.protocol)) {
+            if (!schemesList.has(parsed.protocol)) {
                 return reject(new Error(`Disallowed protocol: ${parsed.protocol}`));
             }
             const isHttps = parsed.protocol === "https:";
