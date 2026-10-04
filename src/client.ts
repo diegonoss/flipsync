@@ -130,7 +130,7 @@ export class SyncClient {
         let buffer = "";
         for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
             buffer += Buffer.from(chunk).toString("utf8");
-            const parts = buffer.split(/\r?\n\r?\n/);
+            const parts = buffer.split(/(?:\r?\n|\r){2}/);
             buffer = parts.pop() || "";
             for (const part of parts) this.processSseMessage(part.trim());
         }
@@ -201,7 +201,7 @@ export class SyncClient {
         if (!message || message.startsWith(":")) return null;
         let eventType = "message";
         let data = "";
-        for (const line of message.split("\n")) {
+        for (const line of message.split(/\r?\n|\r/)) {
             if (line.startsWith("event:")) eventType = line.slice(6).trim();
             else if (line.startsWith("data:")) data = line.slice(5).trim();
         }

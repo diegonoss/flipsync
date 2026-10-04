@@ -175,6 +175,7 @@ export class SyncEngine extends EventEmitter {
 
     // Queued actions when paused
     private pausedQueue: Array<() => Promise<void>> = [];
+    private isDrainingQueue = false;
 
     // Transfer tracking
     private readonly activeTransfersMap = new Map<string, ActiveTransfer>();
@@ -226,7 +227,8 @@ export class SyncEngine extends EventEmitter {
         const tokenFile = path.resolve(".sync-token");
         if (fs.existsSync(tokenFile)) {
             try {
-                return fs.readFileSync(tokenFile, "utf8").trim();
+                const existing = fs.readFileSync(tokenFile, "utf8").trim();
+                if (existing) return existing;
             } catch {
                 return crypto.randomBytes(16).toString("hex");
             }
@@ -311,6 +313,7 @@ export class SyncEngine extends EventEmitter {
         this.currentDownloadReq = null;
         this.activeTransfersMap.clear();
         this.pausedQueue = [];
+        this.isDrainingQueue = false;
         this.status = "idle";
         this.emit("sync:cancelled");
         this.emit("sync:idle");
@@ -366,6 +369,7 @@ export class SyncEngine extends EventEmitter {
 
         this.activeTransfersMap.clear();
         this.pausedQueue = [];
+        this.isDrainingQueue = false;
         this.emit("engine:stopped");
     }
 
@@ -383,23 +387,25 @@ export class SyncEngine extends EventEmitter {
         this.emit("engine:resume");
 
         // Drain queued tasks
-        if (this.pausedQueue.length > 0) {
-            const queue = [...this.pausedQueue];
-            this.pausedQueue = [];
+        if (this.pausedQueue.length > 0 && !this.isDrainingQueue) {
+            this.isDrainingQueue = true;
             void (async () => {
-                const drain = async (index: number): Promise<void> => {
-                    if (index >= queue.length || this._isPaused || !this.isRunning) return;
-                    try {
-                        await queue[index]();
-                    } catch (err: unknown) {
-                        const error = err instanceof Error ? err : new Error(String(err));
-                        this.emit("sync:error", { error, context: "queue:drain" });
+                try {
+                    while (this.pausedQueue.length > 0 && !this._isPaused && this.isRunning) {
+                        const task = this.pausedQueue.shift();
+                        if (!task) break;
+                        try {
+                            await task(); // NOSONAR
+                        } catch (err: unknown) {
+                            const error = err instanceof Error ? err : new Error(String(err));
+                            this.emit("sync:error", { error, context: "queue:drain" });
+                        }
                     }
-                    return drain(index + 1);
-                };
-                await drain(0);
-                if (this.activeTransfersMap.size === 0) {
-                    this.emit("sync:idle");
+                } finally {
+                    this.isDrainingQueue = false;
+                    if (this.activeTransfersMap.size === 0) {
+                        this.emit("sync:idle");
+                    }
                 }
             })();
         }
@@ -495,6 +501,41 @@ export class SyncEngine extends EventEmitter {
         return this.syncDir;
     }
 
+    private attachWatcherScanHandlers(watcher: DirectoryWatcher): void {
+        watcher.on("scan:discovered", ({ totalFiles }: { totalFiles: number }) => {
+            this.stats.totalFiles = totalFiles;
+            this.indexingState = {
+                isIndexing: true,
+                completed: 0,
+                total: totalFiles,
+                currentFile: undefined
+            };
+            this.emit("scan:discovered", { totalFiles });
+        });
+
+        watcher.on("scan:progress", (data: { completed: number; total: number; file: string }) => {
+            const percent = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 100;
+            this.indexingState = {
+                isIndexing: true,
+                completed: data.completed,
+                total: data.total,
+                currentFile: data.file
+            };
+            this.emit("scan:progress", { ...data, percent });
+        });
+
+        watcher.on("scan:complete", ({ totalFiles }: { totalFiles: number }) => {
+            this.stats.totalFiles = totalFiles;
+            this.indexingState = {
+                isIndexing: false,
+                completed: totalFiles,
+                total: totalFiles,
+                currentFile: undefined
+            };
+            this.emit("scan:complete", { totalFiles });
+        });
+    }
+
     private createHostWatcher(): DirectoryWatcher {
         const watcher = new DirectoryWatcher(this.syncDir, this.debounceMs);
         watcher.on("change", (file: SyncFileMeta) => {
@@ -518,6 +559,7 @@ export class SyncEngine extends EventEmitter {
             this.stats.errorsCount++;
             this.emit("sync:error", { error: err, context: "watcher" });
         });
+        this.attachWatcherScanHandlers(watcher);
         return watcher;
     }
 
@@ -706,35 +748,6 @@ export class SyncEngine extends EventEmitter {
 
     private async startHost(): Promise<void> {
         this.watcher = this.createHostWatcher();
-
-        this.watcher.on("scan:discovered", ({ totalFiles }: { totalFiles: number }) => {
-            this.stats.totalFiles = totalFiles;
-            this.indexingState = {
-                isIndexing: true,
-                completed: 0,
-                total: totalFiles,
-                currentFile: undefined
-            };
-            this.emit("scan:discovered", { totalFiles });
-        });
-
-        this.watcher.on("scan:progress", (data: { completed: number; total: number; file: string }) => {
-            const percent = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 100;
-            this.indexingState = {
-                isIndexing: true,
-                completed: data.completed,
-                total: data.total,
-                currentFile: data.file
-            };
-            this.emit("scan:progress", { ...data, percent });
-        });
-
-        this.watcher.on("scan:complete", ({ totalFiles }: { totalFiles: number }) => {
-            this.stats.totalFiles = totalFiles;
-            this.indexingState.isIndexing = false;
-            this.emit("scan:complete", { totalFiles });
-        });
-
         await this.watcher.startWatching();
 
         // 1. Start HTTP & SSE Server immediately
@@ -950,6 +963,7 @@ export class SyncEngine extends EventEmitter {
 
     public async syncManifest(): Promise<void> {
         if (!this.serverUrl) return;
+        this.status = "syncing";
 
         try {
             const res = await this.httpRequest(this.url("/api/manifest"));
@@ -966,7 +980,7 @@ export class SyncEngine extends EventEmitter {
 
             const filesToDownload = await this.filterFilesToDownload(files);
 
-            if (filesToDownload.length > 0 && this.isRunning && this.status !== "idle") {
+            if (filesToDownload.length > 0 && this.isRunning && (this.status as SyncEngineStatus) !== "idle") {
                 this.status = "syncing";
                 this.emit("sync:start", {
                     count: filesToDownload.length,
@@ -1206,7 +1220,7 @@ export class SyncEngine extends EventEmitter {
                 let buffer = "";
                 res.on("data", (chunk: Buffer) => {
                     buffer += chunk.toString("utf8");
-                    const parts = buffer.split(/\r?\n\r?\n/);
+                    const parts = buffer.split(/(?:\r?\n|\r){2}/);
                     buffer = parts.pop() || "";
                     for (const part of parts) this.processSseMessage(part.trim());
                 });
@@ -1289,7 +1303,7 @@ export class SyncEngine extends EventEmitter {
     private processSseMessage(message: string): void {
         if (!message || message.startsWith(":")) return;
 
-        const lines = message.split("\n");
+        const lines = message.split(/\r?\n|\r/);
         let eventType = "message";
         let data = "";
 
