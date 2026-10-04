@@ -75,6 +75,9 @@ jobs:
     runs-on: self-hosted
     needs: [test, sonarqube]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
