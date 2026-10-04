@@ -32,6 +32,7 @@ async function runAll(): Promise<void> {
         console.log(`\n${divider}`);
         console.log(`  [ALL TESTS PASSED] Completed in ${duration}ms.`);
         console.log(`${divider}\n`);
+        process.exit(0);
     } catch (err: unknown) {
         console.error("\n[TEST FAILED]:", err);
         process.exit(1);
