@@ -24,7 +24,7 @@ if (isPublished) {
 
 console.log(`Publishing ${name}@${version} to npm...`);
 try {
-    execSync("pnpm publish --access public --no-git-checks", { stdio: "inherit" });
+    execSync("pnpm publish --access public --no-git-checks --provenance", { stdio: "inherit" });
     console.log(`Successfully published ${name}@${version} to npm!`);
 } catch (error) {
     console.error(`Failed to publish ${name}@${version}:`, error);
