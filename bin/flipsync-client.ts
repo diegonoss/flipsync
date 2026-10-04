@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { SyncEngine } from "../src/core/SyncEngine.js";
-import { runHeadlessCli } from "../src/cli/index.js";
-import { runTui } from "../src/tui/index.js";
+import { startSyncCli } from "../src/cli/index.js";
 
 interface ClientCliOptions {
     server: string;
@@ -62,31 +61,18 @@ async function main(): Promise<void> {
     engine.on("sync:error", (evt) => {
         if (evt.context === "auth" || evt.context === "reconnect:limit") {
             process.stderr.write(`[CLIENT] Fatal: ${evt.error.message}\n`);
-            engine.stop().finally(() => process.exit(1));
+            void engine.stop().finally(() => process.exit(1));
         }
     });
 
     const hasExplicitDir = Boolean(options.target || process.env.SYNC_TARGET);
 
-    if (execMode === "tui") {
-        try {
-            await runTui(engine, { promptFolderOnStart: !hasExplicitDir });
-        } catch (err: unknown) {
-            const error = err instanceof Error ? err : new Error(String(err));
-            process.stderr.write(`[WARN] TUI initialization failed: ${error.message}. Falling back to headless mode.\n`);
-            await runHeadlessCli(engine, {
-                format: options.format,
-                quiet: options.quiet
-            });
-            await engine.start();
-        }
-    } else {
-        await runHeadlessCli(engine, {
-            format: options.format,
-            quiet: options.quiet
-        });
-        await engine.start();
-    }
+    await startSyncCli(engine, {
+        execMode,
+        hasExplicitDir,
+        format: options.format,
+        quiet: options.quiet
+    });
 
     if (options.once) {
         await engine.stop();
@@ -94,8 +80,10 @@ async function main(): Promise<void> {
     }
 }
 
-main().catch((err: unknown) => {
+try {
+    await main();
+} catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err));
     process.stderr.write(`[CLIENT] Fatal error: ${error.message}\n`);
     process.exit(1);
-});
+}

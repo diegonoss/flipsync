@@ -150,36 +150,43 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         headerBox.setContent(lines.join("\n"));
     };
 
+    const renderIdlePanel = (state: ReturnType<typeof engine.getState>) => {
+        const errorsFormatted = state.stats.errorsCount > 0 ? `{red-fg}{bold}${state.stats.errorsCount}{/}` : "0";
+        const conflictsFormatted = state.stats.conflictsCount > 0 ? `{magenta-fg}{bold}${state.stats.conflictsCount}{/}` : "0";
+
+        if (state.indexing?.isIndexing) {
+            const pct = getIndexingPct(state.indexing);
+            const lines = [
+                `{cyan-fg}{bold}Indexing files: ${state.indexing.completed}/${state.indexing.total} (${pct}%){/}`,
+                `  ${renderProgressBar(pct, 26)}`,
+                state.indexing.currentFile ? `  • Current File:       {bold}${state.indexing.currentFile}{/}` : "",
+                "",
+                `{bold}Stats Summary:{/}`,
+                `  • Discovered Files:   {bold}${state.stats.totalFiles}{/}`,
+                `  • Synced Files:       {bold}${state.stats.syncedFiles}{/}`,
+                `  • Errors Encountered: ${errorsFormatted}`
+            ].filter(Boolean);
+            transferBox.setContent(lines.join("\n"));
+            return;
+        }
+
+        transferBox.setContent([
+            `{gray-fg}Engine idle - All queues empty and up to date.{/}`,
+            "",
+            `{bold}Stats Summary:{/}`,
+            `  • Synced Files:       {bold}${state.stats.syncedFiles}{/}`,
+            `  • Total Data:         {bold}${formatBytes(state.stats.bytesTransferred)}{/}`,
+            `  • Conflicts Detected: ${conflictsFormatted}`,
+            `  • Errors Encountered: ${errorsFormatted}`
+        ].join("\n"));
+    };
+
     const renderTransferPanel = () => {
         const state = engine.getState();
         const active = state.activeTransfers.filter((t) => t.percent < 100);
 
         if (active.length === 0) {
-            if (state.indexing?.isIndexing) {
-                const pct = getIndexingPct(state.indexing);
-                const lines = [
-                    `{cyan-fg}{bold}Indexing files: ${state.indexing.completed}/${state.indexing.total} (${pct}%){/}`,
-                    `  ${renderProgressBar(pct, 26)}`,
-                    state.indexing.currentFile ? `  • Current File:       {bold}${state.indexing.currentFile}{/}` : "",
-                    "",
-                    `{bold}Stats Summary:{/}`,
-                    `  • Discovered Files:   {bold}${state.stats.totalFiles}{/}`,
-                    `  • Synced Files:       {bold}${state.stats.syncedFiles}{/}`,
-                    `  • Errors Encountered: ${state.stats.errorsCount > 0 ? `{red-fg}{bold}${state.stats.errorsCount}{/}` : "0"}`
-                ].filter(Boolean);
-                transferBox.setContent(lines.join("\n"));
-                return;
-            }
-
-            transferBox.setContent([
-                `{gray-fg}Engine idle - All queues empty and up to date.{/}`,
-                "",
-                `{bold}Stats Summary:{/}`,
-                `  • Synced Files:       {bold}${state.stats.syncedFiles}{/}`,
-                `  • Total Data:         {bold}${formatBytes(state.stats.bytesTransferred)}{/}`,
-                `  • Conflicts Detected: ${state.stats.conflictsCount > 0 ? `{magenta-fg}{bold}${state.stats.conflictsCount}{/}` : "0"}`,
-                `  • Errors Encountered: ${state.stats.errorsCount > 0 ? `{red-fg}{bold}${state.stats.errorsCount}{/}` : "0"}`
-            ].join("\n"));
+            renderIdlePanel(state);
             return;
         }
 
@@ -203,11 +210,12 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     const renderFooter = () => {
         const state = engine.getState();
-        const statusText = state.isPaused
-            ? "PAUSED (press p to resume)"
-            : state.indexing?.isIndexing
-                ? `INDEXING ${state.indexing.completed}/${state.indexing.total} (${getIndexingPct(state.indexing)}%)`
-                : state.status.toUpperCase();
+        let statusText = state.status.toUpperCase();
+        if (state.isPaused) {
+            statusText = "PAUSED (press p to resume)";
+        } else if (state.indexing?.isIndexing) {
+            statusText = `INDEXING ${state.indexing.completed}/${state.indexing.total} (${getIndexingPct(state.indexing)}%)`;
+        }
         footerBox.setContent(
             ` {bold}[c]{/} Client Cmds  {bold}[f]{/} Folder  {bold}[p]{/} Pause  {bold}[x]{/} Cancel  {bold}[r]{/} Re-sync  {bold}[↑/↓]{/} Scroll  {bold}[q]{/} Quit  |  State: {bold}${statusText}{/}`
         );
@@ -330,7 +338,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             },
             () => {
                 isPickerOpen = false;
-                if (isInitial) cleanExit(0);
+                if (isInitial) void cleanExit(0);
                 else updateAll();
             }
         );
@@ -342,11 +350,11 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         else showCommandModal();
     });
 
-    screen.key(["C-c"], () => cleanExit(0));
+    screen.key(["C-c"], () => void cleanExit(0));
 
     screen.key(["q", "Q"], () => {
         if (activeCommandModal) activeCommandModal.close();
-        else if (!isPickerOpen) cleanExit(0);
+        else if (!isPickerOpen) void cleanExit(0);
     });
 
     screen.key(["x", "X"], () => {

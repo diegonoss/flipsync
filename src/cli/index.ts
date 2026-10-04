@@ -8,6 +8,7 @@ import type {
     SyncConflictEvent,
     SyncErrorEvent
 } from "../core/SyncEngine.js";
+import { runTui } from "../tui/index.js";
 
 export interface HeadlessCliOptions {
     format?: "text" | "json";
@@ -18,7 +19,37 @@ export interface HeadlessCliController {
     stop: () => Promise<void>;
 }
 
-export async function runHeadlessCli(
+function logReadyText(event: SyncEngineReadyEvent, logOut: (msg: string) => void): void {
+    const divider = "-".repeat(50);
+    logOut(`\n${divider}`);
+    logOut(`[READY] FlipSync ${event.role.toUpperCase()} Online`);
+    logOut(`  Directory:  ${event.syncDir}`);
+    logOut(`  Files:      ${event.filesCount}`);
+    if (event.localUrl) {
+        logOut(`  Localhost:  ${event.localUrl}`);
+    }
+    if (event.lanUrl) {
+        logOut(`  Local LAN:  ${event.lanUrl}`);
+    }
+    if (event.tailscaleIp) {
+        logOut(`  Tailscale:  http://${event.tailscaleIp}`);
+    }
+    if (event.tunnelUrl) {
+        logOut(`  Public URL: ${event.tunnelUrl}`);
+    } else if (event.tunnelError) {
+        const shortErr = event.tunnelError.split("\n")[0];
+        logOut(`  Public URL: [FAILED] ${shortErr}`);
+    }
+    if (event.serverUrl) {
+        logOut(`  Connected:  ${event.serverUrl}`);
+    }
+    if (event.token) {
+        logOut(`  Auth Token: ${event.token}`);
+    }
+    logOut(`${divider}\n`);
+}
+
+export function runHeadlessCli(
     engine: SyncEngine,
     options: HeadlessCliOptions = {}
 ): Promise<HeadlessCliController> {
@@ -55,33 +86,7 @@ export async function runHeadlessCli(
                 token: event.token ? "present" : "none"
             }));
         } else {
-            const divider = "-".repeat(50);
-            logOut(`\n${divider}`);
-            logOut(`[READY] FlipSync ${event.role.toUpperCase()} Online`);
-            logOut(`  Directory:  ${event.syncDir}`);
-            logOut(`  Files:      ${event.filesCount}`);
-            if (event.localUrl) {
-                logOut(`  Localhost:  ${event.localUrl}`);
-            }
-            if (event.lanUrl) {
-                logOut(`  Local LAN:  ${event.lanUrl}`);
-            }
-            if (event.tailscaleIp) {
-                logOut(`  Tailscale:  http://${event.tailscaleIp}`);
-            }
-            if (event.tunnelUrl) {
-                logOut(`  Public URL: ${event.tunnelUrl}`);
-            } else if (event.tunnelError) {
-                const shortErr = event.tunnelError.split("\n")[0];
-                logOut(`  Public URL: [FAILED] ${shortErr}`);
-            }
-            if (event.serverUrl) {
-                logOut(`  Connected:  ${event.serverUrl}`);
-            }
-            if (event.token) {
-                logOut(`  Auth Token: ${event.token}`);
-            }
-            logOut(`${divider}\n`);
+            logReadyText(event, logOut);
         }
     });
 
@@ -104,28 +109,25 @@ export async function runHeadlessCli(
     engine.on("sync:file-progress", (event: SyncFileProgressEvent) => {
         if (quiet) return;
 
-        // In headless mode, throttle progress output to 25% increments per file
+        const shouldLog = event.percent === 100 || event.percent - lastProgressPercent >= 25 || lastProgressFile !== event.file;
+        if (!shouldLog) return;
+
+        lastProgressFile = event.file;
+        lastProgressPercent = event.percent;
+
         if (format === "json") {
-            if (event.percent === 100 || event.percent - lastProgressPercent >= 25 || lastProgressFile !== event.file) {
-                lastProgressFile = event.file;
-                lastProgressPercent = event.percent;
-                logOut(JSON.stringify({
-                    timestamp: timestamp(),
-                    event: "sync:file-progress",
-                    file: event.file,
-                    transferred: event.transferred,
-                    total: event.total,
-                    percent: event.percent
-                }));
-            }
+            logOut(JSON.stringify({
+                timestamp: timestamp(),
+                event: "sync:file-progress",
+                file: event.file,
+                transferred: event.transferred,
+                total: event.total,
+                percent: event.percent
+            }));
         } else {
-            if (event.percent === 100 || event.percent - lastProgressPercent >= 25 || lastProgressFile !== event.file) {
-                lastProgressFile = event.file;
-                lastProgressPercent = event.percent;
-                const kb = (event.transferred / 1024).toFixed(1);
-                const totalKb = (event.total / 1024).toFixed(1);
-                logOut(`[PROGRESS] ${event.file}: ${event.percent}% (${kb} / ${totalKb} KB)`);
-            }
+            const kb = (event.transferred / 1024).toFixed(1);
+            const totalKb = (event.total / 1024).toFixed(1);
+            logOut(`[PROGRESS] ${event.file}: ${event.percent}% (${kb} / ${totalKb} KB)`);
         }
     });
 
@@ -222,11 +224,37 @@ export async function runHeadlessCli(
     process.once("SIGINT", sigintHandler);
     process.once("SIGTERM", sigtermHandler);
 
-    return {
+    return Promise.resolve({
         stop: async () => {
             process.removeListener("SIGINT", sigintHandler);
             process.removeListener("SIGTERM", sigtermHandler);
             await shutdown();
         }
-    };
+    });
 }
+
+export interface StartSyncCliOptions {
+    execMode: "tui" | "headless";
+    hasExplicitDir: boolean;
+    format?: "text" | "json";
+    quiet?: boolean;
+}
+
+export async function startSyncCli(engine: SyncEngine, options: StartSyncCliOptions): Promise<void> {
+    if (options.execMode === "tui") {
+        try {
+            await runTui(engine, { promptFolderOnStart: !options.hasExplicitDir });
+            return;
+        } catch (err: unknown) {
+            const error = err instanceof Error ? err : new Error(String(err));
+            process.stderr.write(`[WARN] TUI initialization failed: ${error.message}. Falling back to headless mode.\n`);
+        }
+    }
+
+    await runHeadlessCli(engine, {
+        format: options.format,
+        quiet: options.quiet
+    });
+    await engine.start();
+}
+

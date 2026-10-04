@@ -12,7 +12,11 @@ export class SyncClient {
     private abortController: AbortController | null = null;
 
     constructor(private readonly options: ClientOptions) {
-        this.serverUrl = options.serverUrl.replace(/\/+$/, "");
+        let url = options.serverUrl.trim();
+        while (url.endsWith("/")) {
+            url = url.slice(0, -1);
+        }
+        this.serverUrl = url;
         this.targetDir = path.resolve(options.targetDir);
         this.verbose = options.verbose ?? true;
     }
@@ -33,7 +37,7 @@ export class SyncClient {
             return;
         }
 
-        this.connectSse(1000);
+        void this.connectSse(1000);
     }
 
     public stop(): void {
@@ -62,10 +66,8 @@ export class SyncClient {
             const manifest = (await res.json()) as SyncManifest;
             const files = Object.values(manifest.files || {});
 
-            let syncedCount = 0;
-            for (const file of files) {
-                if (await this.downloadIfChanged(file)) syncedCount++;
-            }
+            const results = await Promise.all(files.map((file) => this.downloadIfChanged(file)));
+            const syncedCount = results.filter(Boolean).length;
 
             if (this.verbose) {
                 console.log(`[CLIENT] Verified ${files.length} remote file(s). ${syncedCount} downloaded/updated.`);
@@ -118,6 +120,16 @@ export class SyncClient {
         return true;
     }
 
+    private async readSseStream(res: Response): Promise<void> {
+        let buffer = "";
+        for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+            buffer += Buffer.from(chunk).toString("utf8");
+            const parts = buffer.split("\n\n");
+            buffer = parts.pop() || "";
+            for (const part of parts) this.processSseMessage(part.trim());
+        }
+    }
+
     private async connectSse(retryDelayMs = 1000): Promise<void> {
         if (!this.isRunning) return;
 
@@ -149,19 +161,11 @@ export class SyncClient {
 
             if (this.verbose) console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
 
-            retryDelayMs = 1000;
-
-            let buffer = "";
-            for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
-                buffer += Buffer.from(chunk).toString("utf8");
-                const parts = buffer.split("\n\n");
-                buffer = parts.pop() || "";
-                for (const part of parts) this.processSseMessage(part.trim());
-            }
+            await this.readSseStream(res);
 
             if (!this.isRunning) return;
             if (this.verbose) console.log("[CLIENT] SSE connection closed by server.");
-            this.scheduleReconnect(retryDelayMs);
+            this.scheduleReconnect(1000);
         } catch (err: unknown) {
             if (!this.isRunning || (err instanceof Error && err.name === "AbortError")) return;
             const error = err instanceof Error ? err : new Error(String(err));
@@ -183,46 +187,57 @@ export class SyncClient {
             } catch (err: unknown) {
                 if (err instanceof Error && err.message.includes("Authentication failed")) return;
             }
-            this.connectSse(delayMs * 2);
+            void this.connectSse(delayMs * 2);
         }, delayMs);
     }
 
-    private processSseMessage(message: string): void {
-        if (!message || message.startsWith(":")) return;
-        let eventType = "message", data = "";
+    private parseSsePayload(message: string): { eventType: string; data: string } | null {
+        if (!message || message.startsWith(":")) return null;
+        let eventType = "message";
+        let data = "";
         for (const line of message.split("\n")) {
             if (line.startsWith("event:")) eventType = line.slice(6).trim();
             else if (line.startsWith("data:")) data = line.slice(5).trim();
         }
-        if (!data) return;
+        return data ? { eventType, data } : null;
+    }
+
+    private handleSseEvent(eventType: string, parsed: SyncEvent): void {
+        const syncFile = (f: SyncFileMeta) => {
+            this.downloadIfChanged(f).catch((err: unknown) => {
+                const error = err instanceof Error ? err : new Error(String(err));
+                if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
+                this.options.onError?.(error);
+            });
+        };
+
+        if (eventType === "init" && parsed.manifest?.files) {
+            for (const file of Object.values(parsed.manifest.files)) syncFile(file);
+        } else if (eventType === "file_changed" && parsed.file) {
+            syncFile(parsed.file);
+        } else if (eventType === "file_deleted" && parsed.filename) {
+            const destPath = path.resolve(this.targetDir, parsed.filename);
+            const rel = path.relative(this.targetDir, destPath);
+            if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+                try { fs.unlinkSync(destPath); } catch {}
+                if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
+                this.options.onDelete?.(parsed.filename);
+            }
+        }
+    }
+
+    private processSseMessage(message: string): void {
+        const payload = this.parseSsePayload(message);
+        if (!payload) return;
 
         try {
-            const parsed = JSON.parse(data) as SyncEvent;
-            const syncFile = (f: SyncFileMeta) => {
-                this.downloadIfChanged(f).catch((err: unknown) => {
-                    const error = err instanceof Error ? err : new Error(String(err));
-                    if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
-                    this.options.onError?.(error);
-                });
-            };
-
-            if (eventType === "init" && parsed.manifest?.files) {
-                for (const file of Object.values(parsed.manifest.files)) syncFile(file);
-            } else if (eventType === "file_changed" && parsed.file) {
-                syncFile(parsed.file);
-            } else if (eventType === "file_deleted" && parsed.filename) {
-                const destPath = path.resolve(this.targetDir, parsed.filename);
-                const rel = path.relative(this.targetDir, destPath);
-                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-                    try { fs.unlinkSync(destPath); } catch {}
-                    if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
-                    this.options.onDelete?.(parsed.filename);
-                }
-            }
+            const parsed = JSON.parse(payload.data) as SyncEvent;
+            this.handleSseEvent(payload.eventType, parsed);
         } catch {}
     }
 
     private url(endpoint: string): string {
-        return `${this.serverUrl}${endpoint}${this.options.token ? `?token=${encodeURIComponent(this.options.token)}` : ""}`;
+        const query = this.options.token ? `?token=${encodeURIComponent(this.options.token)}` : "";
+        return `${this.serverUrl}${endpoint}${query}`;
     }
 }

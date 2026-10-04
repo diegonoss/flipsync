@@ -219,31 +219,34 @@ export class SyncEngine extends EventEmitter {
             this.serverUrl = SyncEngine.sanitizeServerUrl(process.env.SYNC_SERVER);
         }
 
-        // Token resolution
-        const noToken = options.noToken === true || (options.token as unknown) === false;
-        if (noToken) {
-            this.token = undefined;
-        } else if (typeof options.token === "string" && options.token.length > 0) {
-            this.token = options.token;
-        } else if (process.env.SYNC_TOKEN) {
-            this.token = process.env.SYNC_TOKEN;
-        } else if (this.role === "host") {
-            const tokenFile = path.resolve(".sync-token");
-            if (fs.existsSync(tokenFile)) {
-                try {
-                    this.token = fs.readFileSync(tokenFile, "utf8").trim();
-                } catch {
-                    this.token = crypto.randomBytes(16).toString("hex");
-                }
-            } else {
-                this.token = crypto.randomBytes(16).toString("hex");
-                try {
-                    fs.writeFileSync(tokenFile, this.token, { encoding: "utf8", mode: 0o600 });
-                } catch {
-                    // Ignore on read-only filesystems
-                }
+        this.token = SyncEngine.resolveToken(options, this.role);
+    }
+
+    private static resolveHostFileToken(): string {
+        const tokenFile = path.resolve(".sync-token");
+        if (fs.existsSync(tokenFile)) {
+            try {
+                return fs.readFileSync(tokenFile, "utf8").trim();
+            } catch {
+                return crypto.randomBytes(16).toString("hex");
             }
         }
+        const generated = crypto.randomBytes(16).toString("hex");
+        try {
+            fs.writeFileSync(tokenFile, generated, { encoding: "utf8", mode: 0o600 });
+        } catch {
+            // Ignore on read-only filesystems
+        }
+        return generated;
+    }
+
+    private static resolveToken(options: SyncEngineOptions, role: "host" | "client"): string | undefined {
+        const noToken = options.noToken === true || (options.token as unknown) === false;
+        if (noToken) return undefined;
+        if (typeof options.token === "string" && options.token.length > 0) return options.token;
+        if (process.env.SYNC_TOKEN) return process.env.SYNC_TOKEN;
+        if (role === "host") return SyncEngine.resolveHostFileToken();
+        return undefined;
     }
 
     private static isForbiddenHost(hostname: string): boolean {
@@ -383,16 +386,18 @@ export class SyncEngine extends EventEmitter {
         if (this.pausedQueue.length > 0) {
             const queue = [...this.pausedQueue];
             this.pausedQueue = [];
-            (async () => {
-                for (const task of queue) {
-                    if (this._isPaused || !this.isRunning) break;
+            void (async () => {
+                const drain = async (index: number): Promise<void> => {
+                    if (index >= queue.length || this._isPaused || !this.isRunning) return;
                     try {
-                        await task();
+                        await queue[index]();
                     } catch (err: unknown) {
                         const error = err instanceof Error ? err : new Error(String(err));
                         this.emit("sync:error", { error, context: "queue:drain" });
                     }
-                }
+                    return drain(index + 1);
+                };
+                await drain(0);
                 if (this.activeTransfersMap.size === 0) {
                     this.emit("sync:idle");
                 }
@@ -450,12 +455,6 @@ export class SyncEngine extends EventEmitter {
 
     public getState(): SyncEngineState {
         const activeUrl = this.tunnelUrl || this.lanUrl || this.localUrl || this.serverUrl;
-        const endpointsList: string[] = [];
-        if (this.localUrl) endpointsList.push(this.localUrl);
-        if (this.lanUrl) endpointsList.push(this.lanUrl);
-        if (this.tailscaleIp) endpointsList.push(`http://${this.tailscaleIp}:${this.port}`);
-        if (this.tunnelUrl) endpointsList.push(this.tunnelUrl);
-        if (this.serverUrl) endpointsList.push(this.serverUrl);
 
         return {
             role: this.role,
@@ -496,6 +495,98 @@ export class SyncEngine extends EventEmitter {
         return this.syncDir;
     }
 
+    private createHostWatcher(): DirectoryWatcher {
+        const watcher = new DirectoryWatcher(this.syncDir, this.debounceMs);
+        watcher.on("change", (file: SyncFileMeta) => {
+            if (this._isPaused) {
+                this.pausedQueue.push(() => {
+                    this.handleHostFileChange(file);
+                    return Promise.resolve();
+                });
+                return;
+            }
+            this.handleHostFileChange(file);
+        });
+        watcher.on("delete", (filename: string) => {
+            this.stats.totalFiles = Math.max(0, this.stats.totalFiles - 1);
+            this.emit("sync:file-deleted", { file: filename });
+            if (this.activeTransfersMap.size === 0) {
+                this.emit("sync:idle");
+            }
+        });
+        watcher.on("error", (err: Error) => {
+            this.stats.errorsCount++;
+            this.emit("sync:error", { error: err, context: "watcher" });
+        });
+        return watcher;
+    }
+
+    private buildEndpointsList(): string[] {
+        const endpointsList: string[] = [];
+        if (this.localUrl) endpointsList.push(this.localUrl);
+        if (this.lanUrl) endpointsList.push(this.lanUrl);
+        if (this.tailscaleIp) endpointsList.push(`http://${this.tailscaleIp}:${this.port}`);
+        if (this.tunnelUrl) endpointsList.push(this.tunnelUrl);
+        return endpointsList;
+    }
+
+    private async reloadHostSyncDir(): Promise<void> {
+        if (this.watcher) {
+            try {
+                this.watcher.close();
+            } catch {
+                // Ignore
+            }
+        }
+        this.watcher = this.createHostWatcher();
+        const manifest = await this.watcher.initScan();
+        await this.watcher.startWatching();
+        this.stats.totalFiles = Object.keys(manifest.files).length;
+
+        if (this.server) {
+            this.server.setSyncDir(this.syncDir, this.watcher);
+            this.server.notifyPollWaiters({
+                changed: true,
+                timestamp: Date.now(),
+                manifest
+            });
+            this.server.broadcast("manifest_refresh", { timestamp: Date.now() });
+        }
+
+        const endpointsList = this.buildEndpointsList();
+        this.emit("engine:ready", {
+            role: "host",
+            syncDir: this.syncDir,
+            filesCount: this.stats.totalFiles,
+            localUrl: this.localUrl,
+            lanUrl: this.lanUrl,
+            tailscaleIp: this.tailscaleIp,
+            tunnelUrl: this.tunnelUrl,
+            activeUrl: this.tunnelUrl || this.lanUrl || this.localUrl,
+            endpoints: endpointsList,
+            token: this.token
+        });
+        this.status = "idle";
+        this.emit("sync:idle");
+    }
+
+    private async reloadClientSyncDir(): Promise<void> {
+        this.syncedHashes.clear();
+        await this.scanLocalTargetDir();
+        await this.syncManifest();
+        this.emit("engine:ready", {
+            role: "client",
+            syncDir: this.syncDir,
+            filesCount: this.stats.totalFiles,
+            serverUrl: this.serverUrl,
+            activeUrl: this.serverUrl,
+            endpoints: [this.serverUrl!],
+            token: this.token
+        });
+        this.status = "idle";
+        this.emit("sync:idle");
+    }
+
     public async setSyncDir(newDir: string): Promise<void> {
         const resolved = path.resolve(newDir);
         this.syncDir = resolved;
@@ -513,82 +604,9 @@ export class SyncEngine extends EventEmitter {
         if (this.isRunning) {
             this.status = "syncing";
             if (this.role === "host") {
-                if (this.watcher) {
-                    try {
-                        this.watcher.close();
-                    } catch {
-                        // Ignore
-                    }
-                }
-                this.watcher = new DirectoryWatcher(this.syncDir, this.debounceMs);
-                this.watcher.on("change", (file: SyncFileMeta) => {
-                    if (this._isPaused) {
-                        this.pausedQueue.push(async () => this.handleHostFileChange(file));
-                        return;
-                    }
-                    this.handleHostFileChange(file);
-                });
-                this.watcher.on("delete", (filename: string) => {
-                    this.stats.totalFiles = Math.max(0, this.stats.totalFiles - 1);
-                    this.emit("sync:file-deleted", { file: filename });
-                    if (this.activeTransfersMap.size === 0) {
-                        this.emit("sync:idle");
-                    }
-                });
-                this.watcher.on("error", (err: Error) => {
-                    this.stats.errorsCount++;
-                    this.emit("sync:error", { error: err, context: "watcher" });
-                });
-
-                const manifest = await this.watcher.initScan();
-                this.watcher.startWatching();
-                this.stats.totalFiles = Object.keys(manifest.files).length;
-
-                if (this.server) {
-                    this.server.setSyncDir(this.syncDir, this.watcher);
-                    this.server.notifyPollWaiters({
-                        changed: true,
-                        timestamp: Date.now(),
-                        manifest
-                    });
-                    this.server.broadcast("manifest_refresh", { timestamp: Date.now() });
-                }
-
-                const endpointsList: string[] = [];
-                if (this.localUrl) endpointsList.push(this.localUrl);
-                if (this.lanUrl) endpointsList.push(this.lanUrl);
-                if (this.tailscaleIp) endpointsList.push(`http://${this.tailscaleIp}:${this.port}`);
-                if (this.tunnelUrl) endpointsList.push(this.tunnelUrl);
-
-                this.emit("engine:ready", {
-                    role: "host",
-                    syncDir: this.syncDir,
-                    filesCount: this.stats.totalFiles,
-                    localUrl: this.localUrl,
-                    lanUrl: this.lanUrl,
-                    tailscaleIp: this.tailscaleIp,
-                    tunnelUrl: this.tunnelUrl,
-                    activeUrl: this.tunnelUrl || this.lanUrl || this.localUrl,
-                    endpoints: endpointsList,
-                    token: this.token
-                });
-                this.status = "idle";
-                this.emit("sync:idle");
+                await this.reloadHostSyncDir();
             } else {
-                this.syncedHashes.clear();
-                await this.scanLocalTargetDir();
-                await this.syncManifest();
-                this.emit("engine:ready", {
-                    role: "client",
-                    syncDir: this.syncDir,
-                    filesCount: this.stats.totalFiles,
-                    serverUrl: this.serverUrl,
-                    activeUrl: this.serverUrl,
-                    endpoints: [this.serverUrl!],
-                    token: this.token
-                });
-                this.status = "idle";
-                this.emit("sync:idle");
+                await this.reloadClientSyncDir();
             }
         }
     }
@@ -604,31 +622,90 @@ export class SyncEngine extends EventEmitter {
     // =========================================================================
     // Host Mode Implementation
     // =========================================================================
-    private async startHost(): Promise<void> {
-        this.watcher = new DirectoryWatcher(this.syncDir, this.debounceMs);
+    private setupServerTransfers(): void {
+        if (!this.server) return;
 
-        this.watcher.on("change", (file: SyncFileMeta) => {
-            if (this._isPaused) {
-                this.pausedQueue.push(async () => {
-                    this.handleHostFileChange(file);
-                });
-                return;
+        const updateTransfer = (id: string, file: string, transferred: number, total: number) => {
+            let t = this.activeTransfersMap.get(id);
+            if (!t) {
+                t = { file, transferred: 0, total, percent: 0, speedBps: 0, startTime: Date.now(), lastUpdateTime: Date.now(), lastTransferred: 0 };
+                this.activeTransfersMap.set(id, t);
+                this.status = "syncing";
+                this.emit("sync:start", { count: 1, files: [file] });
             }
-            this.handleHostFileChange(file);
-        });
+            t.transferred = transferred;
+            t.total = total;
+            const now = Date.now();
+            const timeDiff = (now - t.lastUpdateTime) / 1000;
+            if (timeDiff >= 0.1 || transferred >= total) {
+                t.speedBps = timeDiff > 0 ? (transferred - t.lastTransferred) / timeDiff : 0;
+                t.percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
+                t.lastUpdateTime = now;
+                t.lastTransferred = transferred;
+                this.emit("sync:file-progress", { file, transferred, total, percent: t.percent });
+            }
+        };
 
-        this.watcher.on("delete", (filename: string) => {
-            this.stats.totalFiles = Math.max(0, this.stats.totalFiles - 1);
-            this.emit("sync:file-deleted", { file: filename });
+        const finishTransfer = (id?: string) => {
+            if (id) this.activeTransfersMap.delete(id);
             if (this.activeTransfersMap.size === 0) {
+                this.status = "idle";
                 this.emit("sync:idle");
             }
-        });
+        };
 
-        this.watcher.on("error", (err: Error) => {
-            this.stats.errorsCount++;
-            this.emit("sync:error", { error: err, context: "watcher" });
+        this.server.on("file_start", (e: { id: string; file: string; size: number }) => updateTransfer(e.id, e.file, 0, e.size));
+        this.server.on("file_progress", (e: { id: string; file: string; transferred: number; total: number }) => updateTransfer(e.id, e.file, e.transferred, e.total));
+        this.server.on("file_served", (e: { id?: string; file: string; size: number; clientIp: string }) => {
+            this.stats.syncedFiles++;
+            this.stats.bytesTransferred += e.size;
+            this.stats.lastSyncTime = Date.now();
+            this.emit("sync:file-progress", { file: e.file, transferred: e.size, total: e.size, percent: 100 });
+            this.emit("sync:file-served", { file: e.file, size: e.size, clientIp: e.clientIp });
+            finishTransfer(e.id);
         });
+        this.server.on("file_aborted", (e: { id: string }) => finishTransfer(e.id));
+    }
+
+    private async startTunnel(): Promise<void> {
+        if (!this.enableTunnel) return;
+
+        this.tunnelState = "connecting";
+        this.tunnelError = undefined;
+        try {
+            this.tunnelResult = await startAutoTunnel(this.port);
+            this.tunnelUrl = this.tunnelResult.url;
+            this.tunnelState = "online";
+            if (this.tunnelUrl) {
+                try {
+                    fs.writeFileSync(".sync-url", this.tunnelUrl, "utf8");
+                } catch {
+                    // Ignore
+                }
+            }
+            if (this.tunnelResult.process) {
+                this.tunnelResult.process.on("exit", (code) => {
+                    if (this.isRunning && this.tunnelState === "online") {
+                        this.tunnelState = "error";
+                        this.tunnelError = `cloudflared exited unexpectedly with code ${code}`;
+                        this.emit("sync:error", {
+                            error: new Error(this.tunnelError),
+                            context: "tunnel:runtime"
+                        });
+                    }
+                });
+            }
+        } catch (err: unknown) {
+            this.tunnelState = "error";
+            const error = err instanceof Error ? err : new Error(String(err));
+            this.tunnelError = error.message;
+            this.stats.errorsCount++;
+            this.emit("sync:error", { error, context: "tunnel:start" });
+        }
+    }
+
+    private async startHost(): Promise<void> {
+        this.watcher = this.createHostWatcher();
 
         this.watcher.on("scan:discovered", ({ totalFiles }: { totalFiles: number }) => {
             this.stats.totalFiles = totalFiles;
@@ -671,46 +748,7 @@ export class SyncEngine extends EventEmitter {
             watcher: this.watcher
         });
 
-        const updateTransfer = (id: string, file: string, transferred: number, total: number) => {
-            let t = this.activeTransfersMap.get(id);
-            if (!t) {
-                t = { file, transferred: 0, total, percent: 0, speedBps: 0, startTime: Date.now(), lastUpdateTime: Date.now(), lastTransferred: 0 };
-                this.activeTransfersMap.set(id, t);
-                this.status = "syncing";
-                this.emit("sync:start", { count: 1, files: [file] });
-            }
-            t.transferred = transferred;
-            t.total = total;
-            const now = Date.now();
-            const timeDiff = (now - t.lastUpdateTime) / 1000;
-            if (timeDiff >= 0.1 || transferred >= total) {
-                t.speedBps = timeDiff > 0 ? (transferred - t.lastTransferred) / timeDiff : 0;
-                t.percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 100;
-                t.lastUpdateTime = now;
-                t.lastTransferred = transferred;
-                this.emit("sync:file-progress", { file, transferred, total, percent: t.percent });
-            }
-        };
-
-        const finishTransfer = (id?: string) => {
-            if (id) this.activeTransfersMap.delete(id);
-            if (this.activeTransfersMap.size === 0) {
-                this.status = "idle";
-                this.emit("sync:idle");
-            }
-        };
-
-        this.server.on("file_start", (e: { id: string; file: string; size: number }) => updateTransfer(e.id, e.file, 0, e.size));
-        this.server.on("file_progress", (e: { id: string; file: string; transferred: number; total: number }) => updateTransfer(e.id, e.file, e.transferred, e.total));
-        this.server.on("file_served", (e: { id?: string; file: string; size: number; clientIp: string }) => {
-            this.stats.syncedFiles++;
-            this.stats.bytesTransferred += e.size;
-            this.stats.lastSyncTime = Date.now();
-            this.emit("sync:file-progress", { file: e.file, transferred: e.size, total: e.size, percent: 100 });
-            this.emit("sync:file-served", { file: e.file, size: e.size, clientIp: e.clientIp });
-            finishTransfer(e.id);
-        });
-        this.server.on("file_aborted", (e: { id: string }) => finishTransfer(e.id));
+        this.setupServerTransfers();
 
         try {
             const info = await this.server.start();
@@ -726,48 +764,11 @@ export class SyncEngine extends EventEmitter {
         }
 
         // 2. Optional Tunnel
-        if (this.enableTunnel) {
-            this.tunnelState = "connecting";
-            this.tunnelError = undefined;
-            try {
-                this.tunnelResult = await startAutoTunnel(this.port);
-                this.tunnelUrl = this.tunnelResult.url;
-                this.tunnelState = "online";
-                if (this.tunnelUrl) {
-                    try {
-                        fs.writeFileSync(".sync-url", this.tunnelUrl, "utf8");
-                    } catch {
-                        // Ignore
-                    }
-                }
-                if (this.tunnelResult.process) {
-                    this.tunnelResult.process.on("exit", (code) => {
-                        if (this.isRunning && this.tunnelState === "online") {
-                            this.tunnelState = "error";
-                            this.tunnelError = `cloudflared exited unexpectedly with code ${code}`;
-                            this.emit("sync:error", {
-                                error: new Error(this.tunnelError),
-                                context: "tunnel:runtime"
-                            });
-                        }
-                    });
-                }
-            } catch (err: unknown) {
-                this.tunnelState = "error";
-                const error = err instanceof Error ? err : new Error(String(err));
-                this.tunnelError = error.message;
-                this.stats.errorsCount++;
-                this.emit("sync:error", { error, context: "tunnel:start" });
-            }
-        }
+        await this.startTunnel();
 
         this.status = "ready";
 
-        const endpointsList: string[] = [];
-        if (this.localUrl) endpointsList.push(this.localUrl);
-        if (this.lanUrl) endpointsList.push(this.lanUrl);
-        if (this.tailscaleIp) endpointsList.push(`http://${this.tailscaleIp}:${this.port}`);
-        if (this.tunnelUrl) endpointsList.push(this.tunnelUrl);
+        const endpointsList = this.buildEndpointsList();
 
         const readyEvent: SyncEngineReadyEvent = {
             role: "host",
@@ -893,7 +894,8 @@ export class SyncEngine extends EventEmitter {
     }
 
     private url(endpoint: string): string {
-        return `${this.serverUrl}${endpoint}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
+        const query = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
+        return `${this.serverUrl}${endpoint}${query}`;
     }
 
     private failFatal(message: string, context: string): Error {
@@ -901,8 +903,49 @@ export class SyncEngine extends EventEmitter {
         this.stats.errorsCount++;
         this.emit("sync:error", { error, context });
         this.status = "error";
-        this.stop();
+        void this.stop();
         return error;
+    }
+
+    private async filterFilesToDownload(files: SyncFileMeta[]): Promise<SyncFileMeta[]> {
+        const toDownload: SyncFileMeta[] = [];
+        const processAt = async (index: number): Promise<void> => {
+            if (index >= files.length || !this.isRunning || this.status === "idle") {
+                return;
+            }
+            const file = files[index];
+            if (this.syncedHashes.get(file.name) !== file.sha256) {
+                const destPath = path.join(this.syncDir, file.name);
+                const localMeta = await computeFileHash(destPath);
+                await setImmediate();
+                if (localMeta?.sha256 === file.sha256) {
+                    this.syncedHashes.set(file.name, file.sha256);
+                } else {
+                    toDownload.push(file);
+                }
+            }
+            return processAt(index + 1);
+        };
+        await processAt(0);
+        return toDownload;
+    }
+
+    private async downloadFilesBatch(files: SyncFileMeta[]): Promise<void> {
+        const downloadAt = async (index: number): Promise<void> => {
+            if (index >= files.length || !this.isRunning || (this.status as SyncEngineStatus) === "idle") {
+                return;
+            }
+            const file = files[index];
+            if (this._isPaused) {
+                this.pausedQueue.push(async () => {
+                    await this.downloadFileWithProgress(file);
+                });
+            } else {
+                await this.downloadFileWithProgress(file);
+            }
+            return downloadAt(index + 1);
+        };
+        await downloadAt(0);
     }
 
     public async syncManifest(): Promise<void> {
@@ -921,21 +964,7 @@ export class SyncEngine extends EventEmitter {
             const files = Object.values(manifest.files || {});
             this.stats.totalFiles = files.length;
 
-            const filesToDownload: SyncFileMeta[] = [];
-            for (const file of files) {
-                if (!this.isRunning || this.status === "idle") break;
-                if (this.syncedHashes.get(file.name) === file.sha256) {
-                    continue;
-                }
-                const destPath = path.join(this.syncDir, file.name);
-                const localMeta = await computeFileHash(destPath);
-                await setImmediate();
-                if (localMeta?.sha256 === file.sha256) {
-                    this.syncedHashes.set(file.name, file.sha256);
-                    continue;
-                }
-                filesToDownload.push(file);
-            }
+            const filesToDownload = await this.filterFilesToDownload(files);
 
             if (filesToDownload.length > 0 && this.isRunning && this.status !== "idle") {
                 this.status = "syncing";
@@ -943,17 +972,7 @@ export class SyncEngine extends EventEmitter {
                     count: filesToDownload.length,
                     files: filesToDownload.map((f) => f.name)
                 });
-
-                for (const file of filesToDownload) {
-                    if (!this.isRunning || (this.status as SyncEngineStatus) === "idle") break;
-                    if (this._isPaused) {
-                        this.pausedQueue.push(async () => {
-                            await this.downloadFileWithProgress(file);
-                        });
-                        continue;
-                    }
-                    await this.downloadFileWithProgress(file);
-                }
+                await this.downloadFilesBatch(filesToDownload);
             }
 
             this.status = "idle";
@@ -965,6 +984,113 @@ export class SyncEngine extends EventEmitter {
             this.emit("sync:error", { error, context: "syncManifest" });
             if (this.syncOnce) throw error;
         }
+    }
+
+    private async checkLocalConflict(file: SyncFileMeta, destPath: string, destDir: string): Promise<boolean> {
+        if (!fs.existsSync(destPath)) {
+            return false;
+        }
+        const localMeta = await computeFileHash(destPath);
+        if (!localMeta) {
+            return false;
+        }
+        if (localMeta.sha256 === file.sha256) {
+            this.syncedHashes.set(file.name, file.sha256);
+            return true;
+        }
+
+        const lastKnown = this.syncedHashes.get(file.name);
+        if (lastKnown && lastKnown !== localMeta.sha256) {
+            this.stats.conflictsCount++;
+            this.emit("sync:conflict", {
+                file: file.name,
+                localVersion: localMeta.sha256.slice(0, 8),
+                remoteVersion: file.sha256.slice(0, 8)
+            });
+
+            try {
+                const conflictBackup = path.join(
+                    destDir,
+                    `${path.basename(file.name)}.conflict.${Date.now()}`
+                );
+                fs.copyFileSync(destPath, conflictBackup);
+            } catch {
+                // Ignore backup failure
+            }
+        }
+        return false;
+    }
+
+    private streamDownload(
+        downloadUrl: string,
+        file: SyncFileMeta,
+        tempPath: string,
+        transferInfo: ActiveTransfer
+    ): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            const parsed = new URL(downloadUrl);
+            const transport = parsed.protocol === "https:" ? https : http;
+
+            const req = transport.get(parsed, (res) => {
+                if (res.statusCode === 401 || res.statusCode === 403) {
+                    res.resume();
+                    return reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
+                }
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error(`Download failed with status ${res.statusCode}`));
+                }
+
+                const total = Number.parseInt(res.headers["content-length"] || "0", 10) || file.size;
+                transferInfo.total = total;
+
+                const hasher = crypto.createHash("sha256");
+                let lastUpdateTime = transferInfo.startTime;
+                let lastTransferred = 0;
+
+                const progressStream = new Transform({
+                    transform: (chunk: Buffer, _enc, cb) => {
+                        hasher.update(chunk);
+                        transferInfo.transferred += chunk.length;
+                        const now = Date.now();
+                        const timeDiff = (now - lastUpdateTime) / 1000;
+
+                        if (timeDiff >= 0.1 || transferInfo.transferred >= total) {
+                            transferInfo.speedBps = timeDiff > 0 ? (transferInfo.transferred - lastTransferred) / timeDiff : 0;
+                            transferInfo.percent = total > 0 ? Math.min(100, Math.round((transferInfo.transferred / total) * 100)) : 100;
+                            lastUpdateTime = now;
+                            lastTransferred = transferInfo.transferred;
+
+                            this.emit("sync:file-progress", {
+                                file: file.name,
+                                transferred: transferInfo.transferred,
+                                total,
+                                percent: transferInfo.percent
+                            });
+                        }
+                        cb(null, chunk);
+                    },
+                    flush: (cb) => {
+                        transferInfo.percent = 100;
+                        cb();
+                    }
+                });
+
+                pipeline(res, progressStream, fs.createWriteStream(tempPath))
+                    .then(() => {
+                        resolve(hasher.digest("hex"));
+                    })
+                    .catch(reject)
+                    .finally(() => {
+                        if (this.currentDownloadReq === req) {
+                            this.currentDownloadReq = null;
+                        }
+                    });
+            });
+
+            this.currentDownloadReq = req;
+            req.on("error", reject);
+        });
     }
 
     public async downloadFileWithProgress(file: SyncFileMeta): Promise<boolean> {
@@ -979,43 +1105,12 @@ export class SyncEngine extends EventEmitter {
             fs.mkdirSync(destDir, { recursive: true });
         }
 
-        // Conflict detection: if local file exists and was modified since last sync
-        if (fs.existsSync(destPath)) {
-            const localMeta = await computeFileHash(destPath);
-            if (localMeta) {
-                if (localMeta.sha256 === file.sha256) {
-                    this.syncedHashes.set(file.name, file.sha256);
-                    return false;
-                }
-
-                // If known last-synced hash differs from current local hash, user modified it locally!
-                const lastKnown = this.syncedHashes.get(file.name);
-                if (lastKnown && lastKnown !== localMeta.sha256) {
-                    this.stats.conflictsCount++;
-                    this.emit("sync:conflict", {
-                        file: file.name,
-                        localVersion: localMeta.sha256.slice(0, 8),
-                        remoteVersion: file.sha256.slice(0, 8)
-                    });
-
-                    // Safely backup conflicting local version
-                    try {
-                        const conflictBackup = path.join(
-                            destDir,
-                            `${path.basename(file.name)}.conflict.${Date.now()}`
-                        );
-                        fs.copyFileSync(destPath, conflictBackup);
-                    } catch {
-                        // Ignore backup failure
-                    }
-                }
-            }
+        if (await this.checkLocalConflict(file, destPath, destDir)) {
+            return false;
         }
 
         const downloadUrl = this.url(`/api/download/${encodeURIComponent(file.name)}`);
         const startTime = Date.now();
-        let lastUpdateTime = startTime;
-        let lastTransferred = 0;
 
         const transferInfo: ActiveTransfer = {
             file: file.name,
@@ -1024,86 +1119,22 @@ export class SyncEngine extends EventEmitter {
             percent: 0,
             speedBps: 0,
             startTime,
-            lastUpdateTime,
+            lastUpdateTime: startTime,
             lastTransferred: 0
         };
         this.activeTransfersMap.set(file.name, transferInfo);
 
         const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
-        let downloadedHash = "";
         let context = `download:${file.name}`;
 
         try {
-            await new Promise<void>((resolve, reject) => {
-                const parsed = new URL(downloadUrl);
-                const transport = parsed.protocol === "https:" ? https : http;
+            const downloadedHash = await this.streamDownload(downloadUrl, file, tempPath, transferInfo);
 
-                const req = transport.get(parsed, (res) => {
-                    if (res.statusCode === 401 || res.statusCode === 403) {
-                        res.resume();
-                        return reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
-                    }
-                    if (res.statusCode !== 200) {
-                        res.resume();
-                        return reject(new Error(`Download failed with status ${res.statusCode}`));
-                    }
-
-                    const total = Number.parseInt(res.headers["content-length"] || "0", 10) || file.size;
-                    transferInfo.total = total;
-
-                    const hasher = crypto.createHash("sha256");
-                    const progressStream = new Transform({
-                        transform: (chunk: Buffer, _enc, cb) => {
-                            hasher.update(chunk);
-                            transferInfo.transferred += chunk.length;
-                            const now = Date.now();
-                            const timeDiff = (now - lastUpdateTime) / 1000;
-
-                            if (timeDiff >= 0.1 || transferInfo.transferred >= total) {
-                                transferInfo.speedBps = timeDiff > 0 ? (transferInfo.transferred - lastTransferred) / timeDiff : 0;
-                                transferInfo.percent = total > 0 ? Math.min(100, Math.round((transferInfo.transferred / total) * 100)) : 100;
-                                lastUpdateTime = now;
-                                lastTransferred = transferInfo.transferred;
-
-                                this.emit("sync:file-progress", {
-                                    file: file.name,
-                                    transferred: transferInfo.transferred,
-                                    total,
-                                    percent: transferInfo.percent
-                                });
-                            }
-                            cb(null, chunk);
-                        },
-                        flush: (cb) => {
-                            transferInfo.percent = 100;
-                            cb();
-                        }
-                    });
-
-                    pipeline(res, progressStream, fs.createWriteStream(tempPath))
-                        .then(() => {
-                            downloadedHash = hasher.digest("hex");
-                            resolve();
-                        })
-                        .catch(reject)
-                        .finally(() => {
-                            if (this.currentDownloadReq === req) {
-                                this.currentDownloadReq = null;
-                            }
-                        });
-                });
-
-                this.currentDownloadReq = req;
-                req.on("error", reject);
-            });
-
-            // Verify SHA-256 integrity
             context = `verify:${file.name}`;
             if (downloadedHash !== file.sha256) {
                 throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
             }
 
-            // Atomic write
             context = `write:${file.name}`;
             fs.renameSync(tempPath, destPath);
 
@@ -1212,6 +1243,49 @@ export class SyncEngine extends EventEmitter {
         }, delayMs);
     }
 
+    private handleSseFileChanged(file: SyncFileMeta): void {
+        if (this._isPaused) {
+            this.pausedQueue.push(async () => {
+                await this.downloadFileWithProgress(file);
+            });
+            return;
+        }
+
+        this.status = "syncing";
+        this.emit("sync:start", { count: 1, files: [file.name] });
+        this.downloadFileWithProgress(file)
+            .then(() => {
+                this.status = "idle";
+                this.emit("sync:idle");
+            })
+            .catch((err: unknown) => {
+                const error = err instanceof Error ? err : new Error(String(err));
+                this.emit("sync:error", { error, context: `sse:${file.name}` });
+                this.status = "idle";
+                this.emit("sync:idle");
+            });
+    }
+
+    private handleSseFileDeleted(filename: string): void {
+        const targetFile = path.resolve(this.syncDir, filename);
+        const rel = path.relative(this.syncDir, targetFile);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            return;
+        }
+        if (fs.existsSync(targetFile)) {
+            try {
+                fs.unlinkSync(targetFile);
+            } catch {
+                // Ignore if locked
+            }
+        }
+        this.syncedHashes.delete(filename);
+        this.emit("sync:file-deleted", { file: filename });
+        if (this.activeTransfersMap.size === 0) {
+            this.emit("sync:idle");
+        }
+    }
+
     private processSseMessage(message: string): void {
         if (!message || message.startsWith(":")) return;
 
@@ -1232,44 +1306,9 @@ export class SyncEngine extends EventEmitter {
         try {
             const parsed = JSON.parse(data) as SyncEvent;
             if (eventType === "file_changed" && parsed.file) {
-                const file = parsed.file;
-                if (this._isPaused) {
-                    this.pausedQueue.push(async () => {
-                        await this.downloadFileWithProgress(file);
-                    });
-                    return;
-                }
-
-                this.status = "syncing";
-                this.emit("sync:start", { count: 1, files: [file.name] });
-                this.downloadFileWithProgress(file)
-                    .then(() => {
-                        this.status = "idle";
-                        this.emit("sync:idle");
-                    })
-                    .catch((err: unknown) => {
-                        const error = err instanceof Error ? err : new Error(String(err));
-                        this.emit("sync:error", { error, context: `sse:${file.name}` });
-                        this.status = "idle";
-                        this.emit("sync:idle");
-                    });
+                this.handleSseFileChanged(parsed.file);
             } else if (eventType === "file_deleted" && parsed.filename) {
-                const targetFile = path.resolve(this.syncDir, parsed.filename);
-                const rel = path.relative(this.syncDir, targetFile);
-                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-                    if (fs.existsSync(targetFile)) {
-                        try {
-                            fs.unlinkSync(targetFile);
-                        } catch {
-                            // Ignore if locked
-                        }
-                    }
-                    this.syncedHashes.delete(parsed.filename);
-                    this.emit("sync:file-deleted", { file: parsed.filename });
-                    if (this.activeTransfersMap.size === 0) {
-                        this.emit("sync:idle");
-                    }
-                }
+                this.handleSseFileDeleted(parsed.filename);
             }
         } catch {
             // Malformed SSE payload ignored
