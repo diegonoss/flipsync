@@ -165,20 +165,20 @@ export async function testStandaloneClients(): Promise<void> {
             assert.equal(fs.readFileSync(path.join(clientDirBash, "sub/deep/file.txt"), "utf8"), "nested-data");
         }
 
-        // 3. Pseudo-Terminal (PTY) execution for real-time progress verification
-        const ptyClientDirJs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-js-"));
-        const ptyClientDirBash = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-bash-"));
-        try {
-            const jsPty = await runInPty(
-                ["node", jsScript, "--server", localUrl, "--token", token, "--target", ptyClientDirJs, "--once"],
-                35
-            );
-            assert.equal(jsPty.code, 0, `JS client in PTY failed: ${jsPty.output}`);
-            assert.match(jsPty.output, /\r/);
-            assert.match(jsPty.output, /Received data\.json/);
-            assert.ok(fs.existsSync(path.join(ptyClientDirJs, "data.json")));
+        // 3. Pseudo-Terminal (PTY) execution for real-time progress verification (POSIX only)
+        if (process.platform !== "win32") {
+            const ptyClientDirJs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-js-"));
+            const ptyClientDirBash = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-bash-"));
+            try {
+                const jsPty = await runInPty(
+                    ["node", jsScript, "--server", localUrl, "--token", token, "--target", ptyClientDirJs, "--once"],
+                    35
+                );
+                assert.equal(jsPty.code, 0, `JS client in PTY failed: ${jsPty.output}`);
+                assert.match(jsPty.output, /\r/);
+                assert.match(jsPty.output, /Received data\.json/);
+                assert.ok(fs.existsSync(path.join(ptyClientDirJs, "data.json")));
 
-            if (process.platform !== "win32") {
                 const bashPty = await runInPty(
                     ["bash", path.resolve("scripts/sync-client.sh"), "--server", localUrl, "--token", token, "--target", ptyClientDirBash, "--once"],
                     35
@@ -187,10 +187,10 @@ export async function testStandaloneClients(): Promise<void> {
                 assert.match(bashPty.output, /\r/);
                 assert.match(bashPty.output, /Received data\.json/);
                 assert.ok(fs.existsSync(path.join(ptyClientDirBash, "data.json")));
+            } finally {
+                fs.rmSync(ptyClientDirJs, { recursive: true, force: true });
+                fs.rmSync(ptyClientDirBash, { recursive: true, force: true });
             }
-        } finally {
-            fs.rmSync(ptyClientDirJs, { recursive: true, force: true });
-            fs.rmSync(ptyClientDirBash, { recursive: true, force: true });
         }
 
         // 4. Verify standalone clients terminate immediately on 401 when token is missing
