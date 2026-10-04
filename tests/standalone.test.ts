@@ -2,10 +2,20 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { exec, spawn } from "node:child_process";
+import { exec, spawn, spawnSync } from "node:child_process";
 import { SyncServer } from "../src/server.js";
 // @ts-ignore - standalone script ESM exports
 import { formatProgressLine, getProgressBar, sanitizeForTerminal } from "../scripts/sync-client.js";
+
+function isPythonPtyAvailable(): boolean {
+    if (process.platform === "win32") return false;
+    try {
+        const res = spawnSync("python3", ["-c", "import pty, termios, fcntl"], { stdio: "ignore" });
+        return res.status === 0;
+    } catch {
+        return false;
+    }
+}
 
 function runInPty(args: string[], cols = 80, rows = 24): Promise<{ code: number; output: string }> {
     return new Promise((resolve, reject) => {
@@ -188,8 +198,8 @@ export async function testStandaloneClients(): Promise<void> {
             assert.equal(fs.readFileSync(path.join(clientDirBash, "sub/deep/file.txt"), "utf8"), "nested-data");
         }
 
-        // 3. Pseudo-Terminal (PTY) execution for real-time progress verification (POSIX only)
-        if (process.platform !== "win32") {
+        // 3. Pseudo-Terminal (PTY) execution for real-time progress verification (POSIX only with python3 pty)
+        if (isPythonPtyAvailable()) {
             const ptyClientDirJs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-js-"));
             const ptyClientDirBash = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-bash-"));
             try {
