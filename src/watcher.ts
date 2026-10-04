@@ -96,6 +96,24 @@ export class DirectoryWatcher extends EventEmitter {
         return this.scanPromise;
     }
 
+    private async statAndRecordEntry(
+        relPath: string,
+        fullPath: string,
+        discovered: DiscoveredEntry[]
+    ): Promise<void> {
+        try {
+            const stat = await fs.promises.stat(fullPath);
+            const existing = this.cache.get(relPath);
+            const cachedMeta =
+                existing?.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1
+                    ? existing
+                    : undefined;
+            discovered.push({ relPath, fullPath, cachedMeta });
+        } catch {
+            // Ignore stat errors for inaccessible / transient files
+        }
+    }
+
     private async discoverEntries(
         dir: string,
         prefix: string,
@@ -110,29 +128,39 @@ export class DirectoryWatcher extends EventEmitter {
             return;
         }
 
-        await Promise.all(
-            entries.map(async (entry) => {
-                if (this.isClosed || signal.aborted || isIgnored(entry.name)) return;
-                const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-                const fullPath = path.join(dir, entry.name);
+        for (const entry of entries) {
+            if (this.isClosed || signal.aborted) break;
+            if (isIgnored(entry.name)) continue;
 
-                if (entry.isDirectory()) {
-                    await this.discoverEntries(fullPath, relPath, signal, discovered);
-                } else if (entry.isFile()) {
-                    try {
-                        const stat = await fs.promises.stat(fullPath);
-                        const existing = this.cache.get(relPath);
-                        const cachedMeta =
-                            existing?.size === stat.size && Math.abs(existing.mtimeMs - stat.mtimeMs) < 1
-                                ? existing
-                                : undefined;
-                        discovered.push({ relPath, fullPath, cachedMeta });
-                    } catch {
-                        // Ignore stat errors for inaccessible / transient files
-                    }
-                }
-            })
-        );
+            const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+            const fullPath = path.join(dir, entry.name);
+
+            if (entry.isDirectory()) {
+                await this.discoverEntries(fullPath, relPath, signal, discovered); // NOSONAR
+            } else if (entry.isFile()) {
+                await this.statAndRecordEntry(relPath, fullPath, discovered); // NOSONAR
+            }
+        }
+    }
+
+    private async hashDiscoveredItem(
+        item: DiscoveredEntry,
+        signal: AbortSignal,
+        discoveredSet: Set<string>
+    ): Promise<void> {
+        discoveredSet.add(item.relPath);
+        if (item.cachedMeta) return;
+
+        const meta = await computeFileHash(item.fullPath, 5, 40, signal);
+        if (meta && !this.isClosed && !signal.aborted) {
+            const fileMeta: SyncFileMeta = { name: item.relPath, ...meta };
+            const prev = this.cache.get(item.relPath);
+            this.cache.set(item.relPath, fileMeta);
+            if (prev?.sha256 !== fileMeta.sha256) {
+                this.emit("change", fileMeta);
+            }
+        }
+        await setImmediate();
     }
 
     private async progressiveHash(
@@ -143,30 +171,12 @@ export class DirectoryWatcher extends EventEmitter {
         const total = discovered.length;
         let completed = 0;
 
-        const processItem = async (index: number): Promise<void> => {
-            if (index >= discovered.length || this.isClosed || signal.aborted) return;
-            const item = discovered[index];
-            discoveredSet.add(item.relPath);
-
-            if (!item.cachedMeta) {
-                const meta = await computeFileHash(item.fullPath, 5, 40, signal);
-                if (meta && !this.isClosed && !signal.aborted) {
-                    const fileMeta: SyncFileMeta = { name: item.relPath, ...meta };
-                    const prev = this.cache.get(item.relPath);
-                    this.cache.set(item.relPath, fileMeta);
-                    if (prev?.sha256 !== fileMeta.sha256) {
-                        this.emit("change", fileMeta);
-                    }
-                }
-                await setImmediate();
-            }
-
+        for (const item of discovered) {
+            if (this.isClosed || signal.aborted) break;
+            await this.hashDiscoveredItem(item, signal, discoveredSet); // NOSONAR
             completed++;
             this.emit("scan:progress", { completed, total, file: item.relPath });
-            return processItem(index + 1);
-        };
-
-        await processItem(0);
+        }
     }
 
     public async startWatching(): Promise<void> {
