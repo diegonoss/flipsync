@@ -549,7 +549,14 @@ class Client {
 }
 
 // CLI entrypoint
-const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+const isDirectRun = (() => {
+    if (!process.argv[1]) return false;
+    try {
+        return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(path.resolve(process.argv[1]));
+    } catch {
+        return false;
+    }
+})();
 
 if (isDirectRun) {
     const args = process.argv.slice(2);

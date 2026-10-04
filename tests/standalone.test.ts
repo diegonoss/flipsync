@@ -136,6 +136,29 @@ export async function testStandaloneClients(): Promise<void> {
         assert.ok(fs.existsSync(path.join(clientDirJs, "sub/deep/file.txt")));
         assert.equal(fs.readFileSync(path.join(clientDirJs, "sub/deep/file.txt"), "utf8"), "nested-data");
 
+        // 1b. Standalone sync-client.js executed via symlink
+        if (process.platform !== "win32") {
+            const symlinkDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-symlink-"));
+            const symlinkScript = path.join(symlinkDir, "symlink-sync-client.js");
+            const symlinkTarget = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-symlink-target-"));
+            try {
+                fs.symlinkSync(jsScript, symlinkScript);
+                await new Promise<void>((resolve, reject) => {
+                    exec(
+                        `node "${symlinkScript}" --server "${localUrl}" --token "${token}" --target "${symlinkTarget}" --once`,
+                        (err, stdout, stderr) => {
+                            if (err) reject(new Error(`Symlinked JS client failed: ${err.message}\n${stdout}\n${stderr}`));
+                            else resolve();
+                        }
+                    );
+                });
+                assert.ok(fs.existsSync(path.join(symlinkTarget, "data.json")));
+            } finally {
+                fs.rmSync(symlinkDir, { recursive: true, force: true });
+                fs.rmSync(symlinkTarget, { recursive: true, force: true });
+            }
+        }
+
         // 2. Standalone sync-client.sh (if bash is available)
         if (process.platform !== "win32") {
             const shScript = path.resolve("scripts/sync-client.sh");
