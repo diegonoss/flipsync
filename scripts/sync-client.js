@@ -13,10 +13,20 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { URL } from "node:url";
 
+/**
+ * Computes SHA-256 hex digest for a given Buffer.
+ * @param {Buffer} buf - Data buffer to hash.
+ * @returns {string} Hexadecimal SHA-256 digest.
+ */
 function computeHash(buf) {
     return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+/**
+ * Reads a local file and calculates its SHA-256 hash.
+ * @param {string} filePath - Absolute path to local file.
+ * @returns {string|null} Hex digest or null if file does not exist.
+ */
 function getFileHash(filePath) {
     try {
         return fs.existsSync(filePath) ? computeHash(fs.readFileSync(filePath)) : null;
@@ -25,6 +35,11 @@ function getFileHash(filePath) {
     }
 }
 
+/**
+ * Formats a byte quantity into a human-readable string (B, KB, MB, GB).
+ * @param {number} bytes - Number of bytes.
+ * @returns {string} Formatted byte string.
+ */
 function formatBytes(bytes) {
     if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`;
     if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
@@ -32,16 +47,32 @@ function formatBytes(bytes) {
     return `${bytes} B`;
 }
 
+/**
+ * Formats a transfer rate in bytes per second.
+ * @param {number} bytesPerSec - Speed in bytes per second.
+ * @returns {string} Formatted speed string (e.g. "1.5 MB/s").
+ */
 function formatSpeed(bytesPerSec) {
     return `${formatBytes(bytesPerSec)}/s`;
 }
 
+/**
+ * Formats estimated remaining duration in seconds.
+ * @param {number} seconds - Remaining time in seconds.
+ * @returns {string} Formatted ETA string.
+ */
 function formatEta(seconds) {
     if (seconds < 60) return `${seconds}s`;
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+/**
+ * Generates an ASCII progress bar string of specified width.
+ * @param {number} percent - Completion percentage (0-100).
+ * @param {number} width - Character width of the bar.
+ * @returns {string} Formatted bar string.
+ */
 function getProgressBar(percent, width = 10) {
     const filled = Math.max(0, Math.min(width, Math.round((width * percent) / 100)));
     const empty = width - filled;
@@ -54,6 +85,18 @@ function getProgressBar(percent, width = 10) {
     }
 }
 
+/**
+ * Formats a single-line progress indicator clamped to terminal width.
+ * @param {string} prefix - Status prefix (e.g. "[SYNC] [1/5]").
+ * @param {string} fileName - File being downloaded.
+ * @param {number} percent - Percentage transferred.
+ * @param {string} curStr - Transferred byte string.
+ * @param {string} totStr - Total byte string.
+ * @param {string} speedStr - Current speed string.
+ * @param {string} etaStr - Estimated time remaining string.
+ * @param {number} maxWidth - Available console columns.
+ * @returns {string} Clamped, padded progress line.
+ */
 function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr, etaStr, maxWidth = 80) {
     const limit = Math.max(30, maxWidth - 1);
     const pctStr = String(percent).padStart(3);
@@ -92,12 +135,24 @@ function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr,
     return line.length < limit ? line.padEnd(limit, " ") : line.slice(0, limit);
 }
 
+/**
+ * Logs a fatal error message to stderr and terminates process with exit code 1.
+ * @param {string} msg - Error message to log.
+ */
 function fatal(msg) {
     console.error(`[CLIENT] [FATAL] ${msg}`);
     process.exit(1);
 }
 
 class Client {
+    /**
+     * Creates an instance of the standalone FlipSync Client.
+     * @param {object} opts - Configuration options.
+     * @param {string} opts.server - Host server base URL.
+     * @param {string} [opts.token] - Optional bearer authentication token.
+     * @param {string} opts.target - Target directory to synchronize.
+     * @param {boolean} [opts.once] - Whether to perform a single sync and exit.
+     */
     constructor(opts) {
         this.server = opts.server.replace(/\/+$/, "");
         this.token = opts.token;
@@ -108,6 +163,10 @@ class Client {
         this.running = false;
     }
 
+    /**
+     * Initializes sync directory, runs initial sync, and connects SSE stream.
+     * @returns {Promise<void>}
+     */
     async start() {
         this.running = true;
         if (!fs.existsSync(this.target)) {
@@ -125,16 +184,28 @@ class Client {
         this.connectSse(1000);
     }
 
+    /**
+     * Stops the client and releases timers and active network connections.
+     */
     stop() {
         this.running = false;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         if (this.activeReq) this.activeReq.destroy();
     }
 
+    /**
+     * Constructs a full API URL with token query parameter if configured.
+     * @param {string} endpoint - API route (e.g. "/api/manifest").
+     * @returns {string} Fully qualified URL.
+     */
     url(endpoint) {
         return `${this.server}${endpoint}${this.token ? `?token=${encodeURIComponent(this.token)}` : ""}`;
     }
 
+    /**
+     * Fetches the host manifest and synchronizes changed or missing files.
+     * @returns {Promise<void>}
+     */
     async syncAll() {
         try {
             const res = await this.httpGet(this.url("/api/manifest"));
@@ -154,6 +225,16 @@ class Client {
         }
     }
 
+    /**
+     * Downloads a file if it does not exist locally or its SHA-256 differs.
+     * @param {object} file - File metadata object.
+     * @param {string} file.name - Relative path on host.
+     * @param {string} file.sha256 - Expected SHA-256 digest.
+     * @param {number} [file.size] - File size in bytes.
+     * @param {number} [idx=0] - 1-based index in batch.
+     * @param {number} [totalFiles=0] - Total count of files in batch.
+     * @returns {Promise<boolean>} True if file was downloaded and written.
+     */
     async downloadIfChanged(file, idx = 0, totalFiles = 0) {
         const dest = path.resolve(this.target, file.name);
         const rel = path.relative(this.target, dest);
@@ -196,6 +277,10 @@ class Client {
         return true;
     }
 
+    /**
+     * Connects to the host Server-Sent Events stream for live file change updates.
+     * @param {number} [backoff=1000] - Reconnection backoff delay in milliseconds.
+     */
     connectSse(backoff = 1000) {
         if (!this.running) return;
 
@@ -256,6 +341,10 @@ class Client {
         req.end();
     }
 
+    /**
+     * Schedules a reconnection attempt with exponential backoff.
+     * @param {number} delay - Backoff delay in milliseconds.
+     */
     retry(delay) {
         if (!this.running) return;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -271,6 +360,10 @@ class Client {
         }, delay);
     }
 
+    /**
+     * Parses an SSE event message and triggers file addition or deletion.
+     * @param {string} msg - Raw SSE message string.
+     */
     handleSseMessage(msg) {
         if (!msg || msg.startsWith(":")) return;
         let event = "message", data = "";
@@ -300,6 +393,12 @@ class Client {
         } catch {}
     }
 
+    /**
+     * Performs an HTTP GET request and returns a string or Buffer.
+     * @param {string} urlStr - Target endpoint URL.
+     * @param {boolean} [asBuffer=false] - Whether to return raw Buffer.
+     * @returns {Promise<{status: number, body: string}|Buffer>} Response payload.
+     */
     httpReq(urlStr, asBuffer = false) {
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);
@@ -320,7 +419,21 @@ class Client {
         });
     }
 
+    /**
+     * Performs an HTTP GET request expecting a UTF-8 text response.
+     * @param {string} urlStr - Target URL.
+     * @returns {Promise<{status: number, body: string}>} Response status and body.
+     */
     httpGet(urlStr) { return this.httpReq(urlStr, false); }
+
+    /**
+     * Streams an HTTP download while rendering a real-time progress indicator.
+     * @param {string} urlStr - Download endpoint URL.
+     * @param {string} [fileName="file"] - Display file name.
+     * @param {number} [totalSize=0] - Expected file size.
+     * @param {string} [prefix="[SYNC]"] - Output line prefix.
+     * @returns {Promise<Buffer>} Complete file content Buffer.
+     */
     httpDownload(urlStr, fileName = "file", totalSize = 0, prefix = "[SYNC]") {
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);

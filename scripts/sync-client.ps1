@@ -77,6 +77,10 @@ Write-Host "================================================================`n" 
 $TokenQuery = if ($Token) { "?token=$([System.Uri]::EscapeDataString($Token))" } else { "" }
 $TokenParam = if ($Token) { "&token=$([System.Uri]::EscapeDataString($Token))" } else { "" }
 
+<#
+.SYNOPSIS
+    Formats a byte count into a human-readable size string.
+#>
 function Format-ByteSize {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return "{0:N1} GB" -f ($Bytes / 1GB) }
@@ -85,6 +89,10 @@ function Format-ByteSize {
     return "$Bytes B"
 }
 
+<#
+.SYNOPSIS
+    Formats a transfer rate into a human-readable speed string.
+#>
 function Format-Speed {
     param([double]$BytesPerSec)
     if ($BytesPerSec -ge 1GB) { return "{0:N1} GB/s" -f ($BytesPerSec / 1GB) }
@@ -93,6 +101,10 @@ function Format-Speed {
     return "{0:N0} B/s" -f $BytesPerSec
 }
 
+<#
+.SYNOPSIS
+    Formats estimated remaining seconds into an ETA string.
+#>
 function Format-Eta {
     param([int]$Seconds)
     if ($Seconds -lt 60) { return "${Seconds}s" }
@@ -100,6 +112,10 @@ function Format-Eta {
     return "$([int]($Seconds / 3600))h $([int](($Seconds % 3600) / 60))m"
 }
 
+<#
+.SYNOPSIS
+    Generates an ASCII progress bar string of specified character width.
+#>
 function Get-ProgressBar {
     param([int]$Percent, [int]$Width = 10)
     $filled = [math]::Max(0, [math]::Min($Width, [int]($Width * $Percent / 100)))
@@ -113,6 +129,10 @@ function Get-ProgressBar {
     }
 }
 
+<#
+.SYNOPSIS
+    Formats a single-line progress indicator clamped to terminal width.
+#>
 function Format-ProgressLine {
     param(
         [string]$Prefix,
@@ -170,6 +190,10 @@ function Format-ProgressLine {
     return $line
 }
 
+<#
+.SYNOPSIS
+    Computes the SHA-256 hash of a local file.
+#>
 function Get-FileSha256 {
     param([string]$FilePath)
     if (-not (Test-Path $FilePath)) { return $null }
@@ -180,6 +204,10 @@ function Get-FileSha256 {
     }
 }
 
+<#
+.SYNOPSIS
+    Checks for HTTP 401 or 403 unauthorized responses and terminates execution.
+#>
 function Check-AuthError {
     param($Err, [string]$Context = "")
     if (($Err.Exception -and $Err.Exception.Response -and [int]$Err.Exception.Response.StatusCode -in 401, 403) -or
@@ -190,6 +218,10 @@ function Check-AuthError {
     }
 }
 
+<#
+.SYNOPSIS
+    Downloads and atomically writes a file if missing or modified.
+#>
 function Sync-File {
     param(
         [string]$FileName,
@@ -368,6 +400,10 @@ function Sync-File {
     }
 }
 
+<#
+.SYNOPSIS
+    Queries the host manifest and synchronizes all files.
+#>
 function Sync-AllFiles {
     try {
         $manifestUrl = "$Server/api/manifest$TokenQuery"

@@ -46,6 +46,7 @@ else
 fi
 echo "================================================================"
 
+# URL-encodes a path component or file name for HTTP requests.
 url_encode() {
     local str="$1"
     if command -v node >/dev/null 2>&1; then
@@ -58,6 +59,7 @@ url_encode() {
     echo "$str"
 }
 
+# Computes SHA-256 hex digest for a given file path.
 calc_sha256() {
     local f="$1"
     command -v sha256sum >/dev/null 2>&1 && sha256sum "$f" | awk '{print $1}' && return
@@ -65,8 +67,10 @@ calc_sha256() {
     node -e "console.log(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))" "$f"
 }
 
+# Formats a byte quantity into a human-readable string (B, KB, MB, GB).
 format_bytes() {
     local b="${1:-0}"
+    [[ ! "$b" =~ ^[0-9]+$ ]] && b=0
     if (( b >= 1073741824 )); then
         local gb=$(( b / 1073741824 ))
         local dec=$(( (b % 1073741824) * 10 / 1073741824 ))
@@ -84,13 +88,17 @@ format_bytes() {
     fi
 }
 
+# Formats a transfer rate in bytes per second into human-readable speed.
 format_speed() {
     local bps="${1:-0}"
+    [[ ! "$bps" =~ ^[0-9]+$ ]] && bps=0
     echo "$(format_bytes "$bps")/s"
 }
 
+# Formats remaining duration in seconds into a human-readable ETA string.
 format_eta() {
     local s="${1:-0}"
+    [[ ! "$s" =~ ^[0-9]+$ ]] && s=0
     if (( s < 60 )); then
         echo "${s}s"
     elif (( s < 3600 )); then
@@ -100,8 +108,11 @@ format_eta() {
     fi
 }
 
+# Generates an ASCII progress bar string of specified width.
 get_progress_bar() {
     local pct="${1:-0}" width="${2:-16}"
+    [[ ! "$pct" =~ ^[0-9]+$ ]] && pct=0
+    [[ ! "$width" =~ ^[0-9]+$ ]] && width=16
     local filled=$(( width * pct / 100 ))
     (( filled > width )) && filled=$width
     (( filled < 0 )) && filled=0
@@ -123,6 +134,7 @@ get_progress_bar() {
     echo "$bar"
 }
 
+# Returns file size in bytes, or 0 if nonexistent.
 get_file_size() {
     local f="$1"
     if [[ ! -e "$f" ]]; then
@@ -132,6 +144,7 @@ get_file_size() {
     stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || echo 0
 }
 
+# Returns current monotonic timestamp in milliseconds.
 get_time_ms() {
     local now
     now="$(date +%s%N 2>/dev/null || true)"
@@ -144,12 +157,13 @@ get_time_ms() {
         read -r up _ < /proc/uptime
         local sec=${up%.*}
         local cs=${up#*.}
-        echo "$(( sec * 1000 + cs * 10 ))"
+        echo "$(( sec * 1000 + 10#$cs * 10 ))"
         return
     fi
     echo "$(( $(date +%s) * 1000 ))"
 }
 
+# Verifies HTTP status code and terminates process on auth errors.
 check_auth() {
     local code="$1"
     local ctx="${2:-}"
@@ -159,6 +173,7 @@ check_auth() {
     fi
 }
 
+# Performs a curl fetch and checks for HTTP authentication failure.
 curl_fetch() {
     local url="$1"
     local out="$2"
@@ -168,6 +183,7 @@ curl_fetch() {
     [[ "$code" == "200" ]]
 }
 
+# Formats a single-line progress indicator clamped to terminal width.
 format_progress_line() {
     local prefix="$1"
     local filename="$2"
@@ -234,6 +250,7 @@ CURRENT_CURL_PID=""
 CURRENT_TMP_FILE=""
 WAS_UPDATED=0
 
+# Cleans up active background curl process and temporary download files.
 cleanup_download() {
     if [[ -n "${CURRENT_CURL_PID:-}" ]]; then
         kill "$CURRENT_CURL_PID" 2>/dev/null || true
@@ -244,14 +261,20 @@ cleanup_download() {
         CURRENT_TMP_FILE=""
     fi
 }
-trap cleanup_download INT TERM
+trap 'cleanup_download; exit 130' INT
+trap 'cleanup_download; exit 143' TERM
 
+# Synchronizes a single file from host, downloading if hash differs.
 sync_file() {
     local name="$1"
     local expected_hash="$2"
     local total_size="${3:-0}"
     local file_idx="${4:-0}"
     local total_files="${5:-0}"
+
+    [[ ! "$total_size" =~ ^[0-9]+$ ]] && total_size=0
+    [[ ! "$file_idx" =~ ^[0-9]+$ ]] && file_idx=0
+    [[ ! "$total_files" =~ ^[0-9]+$ ]] && total_files=0
 
     if [[ "$name" == *".."* || "$name" == /* ]]; then
         echo "[ERROR] Path traversal blocked for $name" >&2
@@ -410,6 +433,7 @@ sync_file() {
     echo "[$(date +%T)] $prefix Received $name ($final_str) in $time_str ($final_spd_str) -> $dest"
 }
 
+# Fetches remote manifest and synchronizes all listed files.
 sync_manifest() {
     local tmp_manifest
     tmp_manifest="$(mktemp)"
