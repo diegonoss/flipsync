@@ -922,43 +922,37 @@ export class SyncEngine extends EventEmitter {
 
     private async filterFilesToDownload(files: SyncFileMeta[]): Promise<SyncFileMeta[]> {
         const toDownload: SyncFileMeta[] = [];
-        const processAt = async (index: number): Promise<void> => {
-            if (index >= files.length || !this.isRunning || this.status === "idle") {
-                return;
+        for (const file of files) {
+            if (!this.isRunning || (this.status as SyncEngineStatus) === "idle") {
+                break;
             }
-            const file = files[index];
             if (this.syncedHashes.get(file.name) !== file.sha256) {
                 const destPath = path.join(this.syncDir, file.name);
-                const localMeta = await computeFileHash(destPath);
-                await setImmediate();
+                const localMeta = await computeFileHash(destPath); // NOSONAR
+                await setImmediate(); // NOSONAR
                 if (localMeta?.sha256 === file.sha256) {
                     this.syncedHashes.set(file.name, file.sha256);
                 } else {
                     toDownload.push(file);
                 }
             }
-            return processAt(index + 1);
-        };
-        await processAt(0);
+        }
         return toDownload;
     }
 
     private async downloadFilesBatch(files: SyncFileMeta[]): Promise<void> {
-        const downloadAt = async (index: number): Promise<void> => {
-            if (index >= files.length || !this.isRunning || (this.status as SyncEngineStatus) === "idle") {
-                return;
+        for (const file of files) {
+            if (!this.isRunning || (this.status as SyncEngineStatus) === "idle") {
+                break;
             }
-            const file = files[index];
             if (this._isPaused) {
                 this.pausedQueue.push(async () => {
                     await this.downloadFileWithProgress(file);
                 });
             } else {
-                await this.downloadFileWithProgress(file);
+                await this.downloadFileWithProgress(file); // NOSONAR
             }
-            return downloadAt(index + 1);
-        };
-        await downloadAt(0);
+        }
     }
 
     public async syncManifest(): Promise<void> {
@@ -1045,12 +1039,21 @@ export class SyncEngine extends EventEmitter {
             const parsed = new URL(downloadUrl);
             const transport = parsed.protocol === "https:" ? https : http;
 
-            const req = transport.get(parsed, (res) => {
+            let req: http.ClientRequest | null = null;
+            const cleanupReq = () => {
+                if (req && this.currentDownloadReq === req) {
+                    this.currentDownloadReq = null;
+                }
+            };
+
+            req = transport.get(parsed, (res) => {
                 if (res.statusCode === 401 || res.statusCode === 403) {
+                    cleanupReq();
                     res.resume();
                     return reject(this.failFatal(`Authentication failed downloading ${file.name}: HTTP ${res.statusCode} (valid bearer token required)`, "auth"));
                 }
                 if (res.statusCode !== 200) {
+                    cleanupReq();
                     res.resume();
                     return reject(new Error(`Download failed with status ${res.statusCode}`));
                 }
@@ -1095,15 +1098,14 @@ export class SyncEngine extends EventEmitter {
                         resolve(hasher.digest("hex"));
                     })
                     .catch(reject)
-                    .finally(() => {
-                        if (this.currentDownloadReq === req) {
-                            this.currentDownloadReq = null;
-                        }
-                    });
+                    .finally(cleanupReq);
             });
 
             this.currentDownloadReq = req;
-            req.on("error", reject);
+            req.on("error", (err) => {
+                cleanupReq();
+                reject(err);
+            });
         });
     }
 
