@@ -145,7 +145,7 @@ function Format-ProgressLine {
         [int]$MaxWidth = 80
     )
 
-    $limit = [math]::Max(30, $MaxWidth - 1)
+    $limit = if ($MaxWidth -gt 1) { $MaxWidth - 1 } else { 1 }
     $pctStr = "{0,3}" -f $Percent
 
     $stats = if ($TotStr) {
@@ -256,7 +256,7 @@ function Sync-File {
 
     $cols = 80
     try {
-        if ([Console]::WindowWidth -ge 40) {
+        if ([Console]::WindowWidth -gt 0) {
             $cols = [Console]::WindowWidth
         }
     } catch {}
@@ -344,7 +344,7 @@ function Sync-File {
         $sw.Stop()
 
         if ($isInteractive) {
-            $limit = [math]::Max(30, $cols - 1)
+            $limit = if ($cols -gt 1) { $cols - 1 } else { 1 }
             $verifyMsg = "$prefix Verifying checksum for $FileName..."
             if ($verifyMsg.Length -gt $limit) {
                 $verifyMsg = $verifyMsg.Substring(0, $limit)
@@ -371,7 +371,7 @@ function Sync-File {
         Move-Item -Path $tempFile -Destination $dest -Force
 
         if ($isInteractive) {
-            $limit = [math]::Max(30, $cols - 1)
+            $limit = if ($cols -gt 1) { $cols - 1 } else { 1 }
             try {
                 [Console]::CursorLeft = 0
                 [Console]::Write(" " * $limit)

@@ -98,7 +98,7 @@ function getProgressBar(percent, width = 10) {
  * @returns {string} Clamped, padded progress line.
  */
 function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr, etaStr, maxWidth = 80) {
-    const limit = Math.max(30, maxWidth - 1);
+    const limit = Math.max(1, maxWidth - 1);
     const pctStr = String(percent).padStart(3);
     const stats = totStr
         ? ` ${pctStr}% (${curStr} / ${totStr}) ${speedStr} ETA ${etaStr}`
@@ -452,8 +452,8 @@ class Client {
                 let lastTransferred = 0;
                 let instantSpeed = 0;
                 const isTTY = !!process.stdout.isTTY;
-                const cols = isTTY ? Math.max(40, process.stdout.columns || 80) : 80;
-                const limit = Math.max(30, cols - 1);
+                const cols = isTTY && process.stdout.columns > 0 ? process.stdout.columns : 80;
+                const limit = Math.max(1, cols - 1);
 
                 const chunks = [];
                 res.on("data", (chunk) => {

@@ -195,7 +195,7 @@ format_progress_line() {
     local max_width="${8:-80}"
 
     local limit=$(( max_width - 1 ))
-    (( limit < 30 )) && limit=30
+    (( limit < 1 )) && limit=1
 
     local stats
     if [[ -n "$tot" ]]; then
@@ -304,7 +304,7 @@ sync_file() {
     local cols=80
     if (( is_tty )); then
         cols=$(tput cols 2>/dev/null || echo 80)
-        (( cols < 40 )) && cols=80
+        [[ ! "$cols" =~ ^[0-9]+$ || cols -le 0 ]] && cols=80
     fi
 
     local code_file
@@ -375,7 +375,7 @@ sync_file() {
 
     if (( is_tty )); then
         local limit=$(( cols - 1 ))
-        (( limit < 30 )) && limit=30
+        (( limit < 1 )) && limit=1
         local verify_msg="${prefix} Verifying checksum for ${name}..."
         if (( ${#verify_msg} > limit )); then
             verify_msg="${verify_msg:0:$limit}"
@@ -425,7 +425,7 @@ sync_file() {
 
     if (( is_tty )); then
         local limit=$(( cols - 1 ))
-        (( limit < 30 )) && limit=30
+        (( limit < 1 )) && limit=1
         printf -v blank "%*s" "$limit" ""
         printf "\r%s\r" "$blank"
     fi
