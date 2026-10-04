@@ -72,12 +72,9 @@ jobs:
 
   deploy:
     name: deploy
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: [test, sonarqube]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
