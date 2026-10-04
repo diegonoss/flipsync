@@ -68,4 +68,4 @@ jobs:
         with:
           skipSignatureVerification: true
           args: >
-            -Dsonar.qualitygate.wait=true
+            ${{ github.event_name == 'pull_request' && '-Dsonar.qualitygate.wait=true' || '' }}
