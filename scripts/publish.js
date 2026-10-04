@@ -22,11 +22,15 @@ if (isPublished) {
     process.exit(0);
 }
 
-console.log(`Publishing ${name}@${version} to npm...`);
+console.log(`Staging ${name}@${version} on npm...`);
 try {
-    execSync("pnpm publish --access public --no-git-checks", { stdio: "inherit" });
-    console.log(`Successfully published ${name}@${version} to npm!`);
+    try {
+        execSync("npm stage publish --access public", { stdio: "inherit" });
+    } catch {
+        execSync("npx -y npm@latest stage publish --access public", { stdio: "inherit" });
+    }
+    console.log(`Successfully staged ${name}@${version} on npm!`);
 } catch (error) {
-    console.error(`Failed to publish ${name}@${version}:`, error);
+    console.error(`Failed to stage ${name}@${version}:`, error);
     process.exit(1);
 }
