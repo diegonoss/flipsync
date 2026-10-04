@@ -25,6 +25,73 @@ function getFileHash(filePath) {
     }
 }
 
+function formatBytes(bytes) {
+    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`;
+    if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${bytes} B`;
+}
+
+function formatSpeed(bytesPerSec) {
+    return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function formatEta(seconds) {
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+function getProgressBar(percent, width = 10) {
+    const filled = Math.max(0, Math.min(width, Math.round((width * percent) / 100)));
+    const empty = width - filled;
+    if (filled > 0 && empty > 0) {
+        return "=".repeat(filled - 1) + ">" + " ".repeat(empty);
+    } else if (filled === width) {
+        return "=".repeat(width);
+    } else {
+        return " ".repeat(width);
+    }
+}
+
+function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr, etaStr, maxWidth = 80) {
+    const limit = Math.max(30, maxWidth - 1);
+    const pctStr = String(percent).padStart(3);
+    const stats = totStr
+        ? ` ${pctStr}% (${curStr} / ${totStr}) ${speedStr} ETA ${etaStr}`
+        : ` ${curStr} (${speedStr})`;
+
+    const overhead = prefix.length + 1 + stats.length;
+    const rem = limit - overhead;
+
+    let barStr = "";
+    if (totStr && rem >= 24) {
+        const barWidth = Math.min(14, Math.max(8, rem - 20));
+        const bar = getProgressBar(percent, barWidth);
+        barStr = ` [${bar}]`;
+    }
+
+    const tail = `${barStr}${stats}`;
+    const avail = limit - prefix.length - 1 - tail.length;
+    let name = fileName;
+    if (name.length > avail) {
+        if (avail >= 7) {
+            const left = Math.floor((avail - 3) / 2);
+            const right = avail - 3 - left;
+            name = fileName.slice(0, left) + "..." + fileName.slice(fileName.length - right);
+        } else if (avail >= 4) {
+            name = fileName.slice(0, avail - 3) + "...";
+        } else if (avail > 0) {
+            name = fileName.slice(0, avail);
+        } else {
+            name = "";
+        }
+    }
+
+    const line = `${prefix} ${name}${tail}`;
+    return line.length < limit ? line.padEnd(limit, " ") : line.slice(0, limit);
+}
+
 function fatal(msg) {
     console.error(`[CLIENT] [FATAL] ${msg}`);
     process.exit(1);
@@ -75,8 +142,10 @@ class Client {
             const manifest = JSON.parse(res.body);
             const files = Object.values(manifest.files || {});
             let updated = 0;
+            let idx = 0;
             for (const f of files) {
-                if (await this.downloadIfChanged(f)) updated++;
+                idx++;
+                if (await this.downloadIfChanged(f, idx, files.length)) updated++;
             }
             console.log(`[CLIENT] Remote check: ${files.length} file(s) verified, ${updated} updated.`);
         } catch (err) {
@@ -85,7 +154,7 @@ class Client {
         }
     }
 
-    async downloadIfChanged(file) {
+    async downloadIfChanged(file, idx = 0, totalFiles = 0) {
         const dest = path.resolve(this.target, file.name);
         const rel = path.relative(this.target, dest);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -102,9 +171,10 @@ class Client {
             if (localHash === file.sha256) return false;
         }
 
+        const prefix = totalFiles > 1 && idx > 0 ? `[SYNC] [${idx}/${totalFiles}]` : "[SYNC]";
         const start = Date.now();
         const encName = file.name.split("/").map(encodeURIComponent).join("/");
-        const buf = await this.httpDownload(this.url(`/api/download/${encName}`));
+        const buf = await this.httpDownload(this.url(`/api/download/${encName}`), file.name, file.size, prefix);
 
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
@@ -118,8 +188,11 @@ class Client {
         fs.renameSync(tmp, dest);
 
         const ms = Date.now() - start;
-        const kb = (file.size / 1024).toFixed(1);
-        console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${ms}ms -> ${dest}`);
+        const durSec = Math.max(0.001, ms / 1000);
+        const finalSizeStr = formatBytes(buf.length);
+        const finalSpeedStr = formatSpeed(buf.length / durSec);
+        const timeStr = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+        console.log(`[CLIENT] ${prefix} Received ${file.name} (${finalSizeStr}) in ${timeStr} (${finalSpeedStr}) -> ${dest}`);
         return true;
     }
 
@@ -248,7 +321,69 @@ class Client {
     }
 
     httpGet(urlStr) { return this.httpReq(urlStr, false); }
-    httpDownload(urlStr) { return this.httpReq(urlStr, true); }
+    httpDownload(urlStr, fileName = "file", totalSize = 0, prefix = "[SYNC]") {
+        return new Promise((resolve, reject) => {
+            const parsed = new URL(urlStr);
+            const transport = parsed.protocol === "https:" ? https : http;
+            const req = transport.get(parsed, (res) => {
+                if (res.statusCode === 401 || res.statusCode === 403) {
+                    fatal(`Authentication failed downloading ${fileName} (HTTP ${res.statusCode}). A valid bearer token is required.`);
+                }
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`HTTP ${res.statusCode}`));
+                }
+
+                const total = parseInt(res.headers["content-length"] || "0", 10) || totalSize || 0;
+                let transferred = 0;
+                let lastUpdateTime = Date.now();
+                let lastTransferred = 0;
+                let instantSpeed = 0;
+                const isTTY = !!process.stdout.isTTY;
+                const cols = isTTY ? Math.max(40, process.stdout.columns || 80) : 80;
+                const limit = Math.max(30, cols - 1);
+
+                const chunks = [];
+                res.on("data", (chunk) => {
+                    chunks.push(chunk);
+                    transferred += chunk.length;
+
+                    const now = Date.now();
+                    const dt = (now - lastUpdateTime) / 1000;
+                    if (dt >= 0.15 || (total > 0 && transferred >= total)) {
+                        if (dt > 0) {
+                            instantSpeed = (transferred - lastTransferred) / dt;
+                        }
+                        lastUpdateTime = now;
+                        lastTransferred = transferred;
+
+                        if (isTTY) {
+                            const curStr = formatBytes(transferred);
+                            const spdStr = formatSpeed(instantSpeed);
+                            const pct = total > 0 ? Math.min(100, Math.max(0, Math.round((transferred / total) * 100))) : 0;
+                            const totStr = total > 0 ? formatBytes(total) : "";
+                            let etaStr = "--:--";
+                            if (instantSpeed > 0 && total > 0 && transferred < total) {
+                                etaStr = formatEta(Math.round((total - transferred) / instantSpeed));
+                            } else if (total > 0 && transferred >= total) {
+                                etaStr = "0s";
+                            }
+                            const line = formatProgressLine(prefix, fileName, pct, curStr, totStr, spdStr, etaStr, cols);
+                            process.stdout.write(`\r${line}`);
+                        }
+                    }
+                });
+
+                res.on("end", () => {
+                    if (isTTY) {
+                        process.stdout.write(`\r${" ".repeat(limit)}\r`);
+                    }
+                    resolve(Buffer.concat(chunks));
+                });
+                res.on("error", reject);
+            });
+            req.on("error", reject);
+        });
+    }
 }
 
 // CLI entrypoint

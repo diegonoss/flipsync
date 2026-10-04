@@ -32,6 +32,7 @@ export async function testStandaloneClients(): Promise<void> {
     try {
         // 1. Standalone sync-client.js
         const jsScript = path.resolve("scripts/sync-client.js");
+        let jsStdout = "";
         await new Promise<void>((resolve, reject) => {
             exec(
                 `node "${jsScript}" --server "${localUrl}" --token "${token}" --target "${clientDirJs}" --once`,
@@ -39,12 +40,15 @@ export async function testStandaloneClients(): Promise<void> {
                     if (err) {
                         reject(new Error(`JS Client failed: ${err.message}\n${stdout}\n${stderr}`));
                     } else {
+                        jsStdout = stdout;
                         resolve();
                     }
                 }
             );
         });
 
+        assert.match(jsStdout, /Received data\.json/);
+        assert.match(jsStdout, /\/s/);
         assert.ok(fs.existsSync(path.join(clientDirJs, "data.json")));
         const jsData = JSON.parse(fs.readFileSync(path.join(clientDirJs, "data.json"), "utf8"));
         assert.equal(jsData.message, "hello standalone");
@@ -56,6 +60,7 @@ export async function testStandaloneClients(): Promise<void> {
         // 2. Standalone sync-client.sh (if bash is available)
         if (process.platform !== "win32") {
             const shScript = path.resolve("scripts/sync-client.sh");
+            let bashStdout = "";
             await new Promise<void>((resolve, reject) => {
                 exec(
                     `bash "${shScript}" --server "${localUrl}" --token "${token}" --target "${clientDirBash}" --once`,
@@ -63,12 +68,15 @@ export async function testStandaloneClients(): Promise<void> {
                         if (err) {
                             reject(new Error(`Bash Client failed: ${err.message}\n${stdout}\n${stderr}`));
                         } else {
+                            bashStdout = stdout;
                             resolve();
                         }
                     }
                 );
             });
 
+            assert.match(bashStdout, /Received data\.json/);
+            assert.match(bashStdout, /\/s/);
             assert.ok(fs.existsSync(path.join(clientDirBash, "data.json")));
             const bashData = JSON.parse(fs.readFileSync(path.join(clientDirBash, "data.json"), "utf8"));
             assert.equal(bashData.message, "hello standalone");
