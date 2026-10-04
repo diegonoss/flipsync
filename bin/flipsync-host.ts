@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import path from "node:path";
 import { Command } from "commander";
 import { SyncEngine } from "../src/core/SyncEngine.js";
 import { runHeadlessCli } from "../src/cli/index.js";
@@ -55,18 +54,9 @@ async function main(): Promise<void> {
     await program.parseAsync(process.argv);
     const options = program.opts<HostCliOptions>();
 
-    if (options.dir) {
-        const resolved = path.resolve(options.dir);
-        const baseDir = path.dirname(resolved);
-        if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
-            console.error(`[ERROR] Invalid directory path: ${options.dir}`);
-            process.exit(1);
-        }
-    }
-
     const execMode = determineExecutionMode(options);
-    const port = options.port ? parseInt(options.port, 10) : undefined;
-    const debounceMs = options.debounce ? parseInt(options.debounce, 10) : undefined;
+    const port = options.port ? Number.parseInt(options.port, 10) : undefined;
+    const debounceMs = options.debounce ? Number.parseInt(options.debounce, 10) : undefined;
 
     const engine = new SyncEngine({
         role: "host",

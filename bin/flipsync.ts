@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import path from "node:path";
 import { SyncEngine } from "../src/core/SyncEngine.js";
 import { runHeadlessCli } from "../src/cli/index.js";
 import { runTui } from "../src/tui/index.js";
@@ -39,40 +38,10 @@ function determineExecutionMode(options: CliOptions): "tui" | "headless" {
 }
 
 async function startEngine(role: "host" | "client", options: CliOptions): Promise<void> {
-    if (options.dir) {
-        const resolved = path.resolve(options.dir);
-        const baseDir = path.dirname(resolved);
-        if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
-            console.error(`[ERROR] Invalid directory path: ${options.dir}`);
-            process.exit(1);
-        }
-    }
-    if (options.target) {
-        const resolved = path.resolve(options.target);
-        const baseDir = path.dirname(resolved);
-        if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
-            console.error(`[ERROR] Invalid target path: ${options.target}`);
-            process.exit(1);
-        }
-    }
-    if (options.server) {
-        const schemesList = ["http:", "https:"];
-        try {
-            const parsedServer = new URL(options.server);
-            if (!schemesList.includes(parsedServer.protocol)) {
-                console.error(`[ERROR] Server URL must use http: or https: (got ${parsedServer.protocol})`);
-                process.exit(1);
-            }
-        } catch {
-            console.error(`[ERROR] Invalid server URL: ${options.server}`);
-            process.exit(1);
-        }
-    }
-
     const execMode = determineExecutionMode(options);
 
-    const port = options.port ? parseInt(options.port, 10) : undefined;
-    const debounceMs = options.debounce ? parseInt(options.debounce, 10) : undefined;
+    const port = options.port ? Number.parseInt(options.port, 10) : undefined;
+    const debounceMs = options.debounce ? Number.parseInt(options.debounce, 10) : undefined;
 
     const engine = new SyncEngine({
         role,
