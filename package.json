@@ -1,6 +1,6 @@
 {
   "name": "flipsync",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Zero-friction real-time file synchronization across networks via Cloudflare Tunnels, Tailscale, or LAN",
   "type": "module",
   "main": "dist/index.js",
