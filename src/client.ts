@@ -130,7 +130,7 @@ export class SyncClient {
         let buffer = "";
         for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
             buffer += Buffer.from(chunk).toString("utf8");
-            const parts = buffer.split("\n\n");
+            const parts = buffer.split(/\r?\n\r?\n/);
             buffer = parts.pop() || "";
             for (const part of parts) this.processSseMessage(part.trim());
         }

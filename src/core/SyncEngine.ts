@@ -1206,7 +1206,7 @@ export class SyncEngine extends EventEmitter {
                 let buffer = "";
                 res.on("data", (chunk: Buffer) => {
                     buffer += chunk.toString("utf8");
-                    const parts = buffer.split("\n\n");
+                    const parts = buffer.split(/\r?\n\r?\n/);
                     buffer = parts.pop() || "";
                     for (const part of parts) this.processSseMessage(part.trim());
                 });

@@ -315,33 +315,38 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         });
     };
 
-    const showFolderSelector = (isInitial = false) => {
-        if (isModalOpen()) return;
+    const showFolderSelector = (isInitial = false): Promise<void> => {
+        if (isModalOpen()) return Promise.resolve();
         isPickerOpen = true;
 
-        openFolderPicker(
-            screen,
-            {
-                initialDir: engine.getSyncDir(),
-                title: isInitial ? "Select Folder to Synchronize" : "Change Synchronization Directory"
-            },
-            async (chosenDir: string) => {
-                isPickerOpen = false;
-                try {
-                    await engine.setSyncDir(chosenDir);
-                    await engine.start();
-                    addLog("FOLDER", `Sync directory set to: {underline}${chosenDir}{/}`, "cyan");
-                    updateAll();
-                } catch (err) {
-                    addLog("ERROR", `Failed to set folder: ${err instanceof Error ? err.message : String(err)}`, "red");
+        return new Promise<void>((resolve) => {
+            openFolderPicker(
+                screen,
+                {
+                    initialDir: engine.getSyncDir(),
+                    title: isInitial ? "Select Folder to Synchronize" : "Change Synchronization Directory"
+                },
+                async (chosenDir: string) => {
+                    isPickerOpen = false;
+                    try {
+                        await engine.setSyncDir(chosenDir);
+                        await engine.start();
+                        addLog("FOLDER", `Sync directory set to: {underline}${chosenDir}{/}`, "cyan");
+                        updateAll();
+                    } catch (err) {
+                        addLog("ERROR", `Failed to set folder: ${err instanceof Error ? err.message : String(err)}`, "red");
+                    } finally {
+                        resolve();
+                    }
+                },
+                () => {
+                    isPickerOpen = false;
+                    if (isInitial) void cleanExit(0);
+                    else updateAll();
+                    resolve();
                 }
-            },
-            () => {
-                isPickerOpen = false;
-                if (isInitial) void cleanExit(0);
-                else updateAll();
-            }
-        );
+            );
+        });
     };
 
     screen.key(["c", "C"], () => {
@@ -379,7 +384,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     });
 
     screen.key(["f", "F"], () => {
-        if (!isModalOpen()) showFolderSelector(false);
+        if (!isModalOpen()) void showFolderSelector(false);
     });
 
     const scrollLog = (lines: number) => {
@@ -407,7 +412,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
     // If folder wasn't specified on CLI, prompt user to select folder immediately upon entering TUI
     if (options.promptFolderOnStart) {
-        showFolderSelector(true);
+        await showFolderSelector(true);
     } else {
         await engine.start();
     }
