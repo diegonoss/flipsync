@@ -202,27 +202,40 @@ export class SyncClient {
         return data ? { eventType, data } : null;
     }
 
-    private handleSseEvent(eventType: string, parsed: SyncEvent): void {
-        const syncFile = (f: SyncFileMeta) => {
-            this.downloadIfChanged(f).catch((err: unknown) => {
-                const error = err instanceof Error ? err : new Error(String(err));
-                if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
-                this.options.onError?.(error);
-            });
-        };
+    private syncSseFile(f: SyncFileMeta): void {
+        this.downloadIfChanged(f).catch((err: unknown) => {
+            const error = err instanceof Error ? err : new Error(String(err));
+            if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
+            this.options.onError?.(error);
+        });
+    }
 
+    private handleFileDeleted(filename: string): void {
+        const destPath = path.resolve(this.targetDir, filename);
+        const rel = path.relative(this.targetDir, destPath);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            return;
+        }
+        try {
+            fs.unlinkSync(destPath);
+        } catch {}
+        if (this.verbose) console.log(`[CLIENT] Host deleted: ${filename}`);
+        this.options.onDelete?.(filename);
+    }
+
+    private handleSseEvent(eventType: string, parsed: SyncEvent): void {
         if (eventType === "init" && parsed.manifest?.files) {
-            for (const file of Object.values(parsed.manifest.files)) syncFile(file);
-        } else if (eventType === "file_changed" && parsed.file) {
-            syncFile(parsed.file);
-        } else if (eventType === "file_deleted" && parsed.filename) {
-            const destPath = path.resolve(this.targetDir, parsed.filename);
-            const rel = path.relative(this.targetDir, destPath);
-            if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-                try { fs.unlinkSync(destPath); } catch {}
-                if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
-                this.options.onDelete?.(parsed.filename);
+            for (const file of Object.values(parsed.manifest.files)) {
+                this.syncSseFile(file);
             }
+            return;
+        }
+        if (eventType === "file_changed" && parsed.file) {
+            this.syncSseFile(parsed.file);
+            return;
+        }
+        if (eventType === "file_deleted" && parsed.filename) {
+            this.handleFileDeleted(parsed.filename);
         }
     }
 
