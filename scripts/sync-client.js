@@ -11,7 +11,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { URL } from "node:url";
+import { URL, fileURLToPath } from "node:url";
 
 /**
  * Computes SHA-256 hex digest for a given Buffer.
@@ -86,6 +86,18 @@ function getProgressBar(percent, width = 10) {
 }
 
 /**
+ * Strips ANSI escape sequences and replaces control characters for safe terminal output.
+ * @param {string} str - Raw string.
+ * @returns {string} Sanitized string safe for terminal rendering.
+ */
+function sanitizeForTerminal(str) {
+    if (typeof str !== "string") return "";
+    return str
+        .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+        .replace(/[\x00-\x1f\x7f-\x9f]/g, "?");
+}
+
+/**
  * Formats a single-line progress indicator clamped to terminal width.
  * @param {string} prefix - Status prefix (e.g. "[SYNC] [1/5]").
  * @param {string} fileName - File being downloaded.
@@ -99,6 +111,7 @@ function getProgressBar(percent, width = 10) {
  */
 function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr, etaStr, maxWidth = 80) {
     const limit = Math.max(1, maxWidth - 1);
+    const safeName = sanitizeForTerminal(fileName);
     const pctStr = String(percent).padStart(3);
     const stats = totStr
         ? ` ${pctStr}% (${curStr} / ${totStr}) ${speedStr} ETA ${etaStr}`
@@ -116,16 +129,16 @@ function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr,
 
     const tail = `${barStr}${stats}`;
     const avail = limit - prefix.length - 1 - tail.length;
-    let name = fileName;
+    let name = safeName;
     if (name.length > avail) {
         if (avail >= 7) {
             const left = Math.floor((avail - 3) / 2);
             const right = avail - 3 - left;
-            name = fileName.slice(0, left) + "..." + fileName.slice(fileName.length - right);
+            name = safeName.slice(0, left) + "..." + safeName.slice(safeName.length - right);
         } else if (avail >= 4) {
-            name = fileName.slice(0, avail - 3) + "...";
+            name = safeName.slice(0, avail - 3) + "...";
         } else if (avail > 0) {
-            name = fileName.slice(0, avail);
+            name = safeName.slice(0, avail);
         } else {
             name = "";
         }
@@ -161,6 +174,41 @@ class Client {
         this.reconnectTimer = null;
         this.activeReq = null;
         this.running = false;
+        this.downloadQueue = [];
+        this.isProcessingQueue = false;
+    }
+
+    /**
+     * Enqueues a file for sequential download to avoid stdout collisions.
+     * @param {object} file - File metadata object.
+     * @param {number} [idx=0] - 1-based index in batch.
+     * @param {number} [total=0] - Total count of files in batch.
+     * @returns {Promise<boolean>}
+     */
+    queueFile(file, idx = 0, total = 0) {
+        return new Promise((resolve, reject) => {
+            this.downloadQueue.push({ file, idx, total, resolve, reject });
+            this.processQueue();
+        });
+    }
+
+    /**
+     * Processes enqueued file downloads sequentially.
+     */
+    async processQueue() {
+        if (this.isProcessingQueue || !this.running) return;
+        this.isProcessingQueue = true;
+        while (this.downloadQueue.length > 0 && this.running) {
+            const item = this.downloadQueue.shift();
+            try {
+                const res = await this.downloadIfChanged(item.file, item.idx, item.total);
+                item.resolve(res);
+            } catch (err) {
+                console.error(`[CLIENT] [ERROR] Failed update: ${err.message}`);
+                item.reject(err);
+            }
+        }
+        this.isProcessingQueue = false;
     }
 
     /**
@@ -189,6 +237,7 @@ class Client {
      */
     stop() {
         this.running = false;
+        this.downloadQueue = [];
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         if (this.activeReq) this.activeReq.destroy();
     }
@@ -273,7 +322,8 @@ class Client {
         const finalSizeStr = formatBytes(buf.length);
         const finalSpeedStr = formatSpeed(buf.length / durSec);
         const timeStr = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
-        console.log(`[CLIENT] ${prefix} Received ${file.name} (${finalSizeStr}) in ${timeStr} (${finalSpeedStr}) -> ${dest}`);
+        const displayName = sanitizeForTerminal(file.name);
+        console.log(`[CLIENT] ${prefix} Received ${displayName} (${finalSizeStr}) in ${timeStr} (${finalSpeedStr}) -> ${dest}`);
         return true;
     }
 
@@ -375,19 +425,17 @@ class Client {
 
         try {
             const parsed = JSON.parse(data);
-            const syncFile = (f) => this.downloadIfChanged(f).catch((e) =>
-                console.error(`[CLIENT] [ERROR] Failed update: ${e.message}`)
-            );
             if (event === "init" && parsed.manifest?.files) {
-                Object.values(parsed.manifest.files).forEach(syncFile);
+                const files = Object.values(parsed.manifest.files);
+                files.forEach((f, i) => this.queueFile(f, i + 1, files.length).catch(() => {}));
             } else if (event === "file_changed" && parsed.file) {
-                syncFile(parsed.file);
+                this.queueFile(parsed.file).catch(() => {});
             } else if (event === "file_deleted" && parsed.filename) {
                 const dest = path.resolve(this.target, parsed.filename);
                 const rel = path.relative(this.target, dest);
                 if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
                     try { fs.unlinkSync(dest); } catch {}
-                    console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
+                    console.log(`[CLIENT] Host deleted: ${sanitizeForTerminal(parsed.filename)}`);
                 }
             }
         } catch {}
@@ -438,9 +486,10 @@ class Client {
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);
             const transport = parsed.protocol === "https:" ? https : http;
+            const displayName = sanitizeForTerminal(fileName);
             const req = transport.get(parsed, (res) => {
                 if (res.statusCode === 401 || res.statusCode === 403) {
-                    fatal(`Authentication failed downloading ${fileName} (HTTP ${res.statusCode}). A valid bearer token is required.`);
+                    fatal(`Authentication failed downloading ${displayName} (HTTP ${res.statusCode}). A valid bearer token is required.`);
                 }
                 if (res.statusCode !== 200) {
                     return reject(new Error(`HTTP ${res.statusCode}`));
@@ -480,7 +529,7 @@ class Client {
                             } else if (total > 0 && transferred >= total) {
                                 etaStr = "0s";
                             }
-                            const line = formatProgressLine(prefix, fileName, pct, curStr, totStr, spdStr, etaStr, cols);
+                            const line = formatProgressLine(prefix, displayName, pct, curStr, totStr, spdStr, etaStr, cols);
                             process.stdout.write(`\r${line}`);
                         }
                     }
@@ -500,15 +549,18 @@ class Client {
 }
 
 // CLI entrypoint
-const args = process.argv.slice(2);
-const getArg = (s, l) => {
-    const i = Math.max(args.indexOf(s), args.indexOf(l));
-    return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
-};
-const hasFlag = (s, l) => args.includes(s) || args.includes(l);
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
-if (hasFlag("-h", "--help")) {
-    console.log(`
+if (isDirectRun) {
+    const args = process.argv.slice(2);
+    const getArg = (s, l) => {
+        const i = Math.max(args.indexOf(s), args.indexOf(l));
+        return i !== -1 && i + 1 < args.length ? args[i + 1] : undefined;
+    };
+    const hasFlag = (s, l) => args.includes(s) || args.includes(l);
+
+    if (hasFlag("-h", "--help")) {
+        console.log(`
 FlipSync — Standalone Zero-Dependency Client
 
 Usage:
@@ -521,33 +573,44 @@ Options:
   --once                 Sync once and exit
   -h, --help             Show this help
 `);
-    process.exit(0);
-}
+        process.exit(0);
+    }
 
-const server = getArg("-s", "--server") || process.env.SYNC_SERVER;
-if (!server) {
-    console.error("[ERROR] Missing required option: --server <URL>\nRun with --help for details.");
-    process.exit(1);
-}
-
-const client = new Client({
-    server,
-    token: getArg("-t", "--token") || process.env.SYNC_TOKEN,
-    target: getArg("", "--target") || process.env.SYNC_TARGET || ".",
-    once: hasFlag("", "--once")
-});
-
-const onExit = () => {
-    console.log("\n[CLIENT] Exiting.");
-    client.stop();
-    process.exit(0);
-};
-process.on("SIGINT", onExit);
-process.on("SIGTERM", onExit);
-
-client.start()
-    .then(() => { if (client.once) process.exit(0); })
-    .catch((err) => {
-        console.error("[CLIENT] [FATAL]", err.message);
+    const server = getArg("-s", "--server") || process.env.SYNC_SERVER;
+    if (!server) {
+        console.error("[ERROR] Missing required option: --server <URL>\nRun with --help for details.");
         process.exit(1);
+    }
+
+    const client = new Client({
+        server,
+        token: getArg("-t", "--token") || process.env.SYNC_TOKEN,
+        target: getArg("", "--target") || process.env.SYNC_TARGET || ".",
+        once: hasFlag("", "--once")
     });
+
+    const onExit = () => {
+        console.log("\n[CLIENT] Exiting.");
+        client.stop();
+        process.exit(0);
+    };
+    process.on("SIGINT", onExit);
+    process.on("SIGTERM", onExit);
+
+    client.start()
+        .then(() => { if (client.once) process.exit(0); })
+        .catch((err) => {
+            console.error("[CLIENT] [FATAL]", err.message);
+            process.exit(1);
+        });
+}
+
+export {
+    formatProgressLine,
+    getProgressBar,
+    formatBytes,
+    formatSpeed,
+    formatEta,
+    sanitizeForTerminal,
+    Client
+};

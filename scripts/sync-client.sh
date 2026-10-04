@@ -8,43 +8,7 @@ SERVER="${SYNC_SERVER:-}"
 TOKEN="${SYNC_TOKEN:-}"
 TARGET="${SYNC_TARGET:-.}"
 ONCE=false
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --server|-s) SERVER="$2"; shift 2 ;;
-        --token|-t) TOKEN="$2"; shift 2 ;;
-        --target) TARGET="$2"; shift 2 ;;
-        --once) ONCE=true; shift ;;
-        --help|-h)
-            echo "Usage: ./sync-client.sh --server <URL> [--token <TOKEN>] [--target <FOLDER>] [--once]"
-            exit 0
-            ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
-
-if [[ -z "$SERVER" ]]; then
-    echo "Usage: ./sync-client.sh --server <URL> [--token <TOKEN>] [--target <FOLDER>] [--once]"
-    exit 1
-fi
-
-SERVER="${SERVER%/}"
-mkdir -p "$TARGET"
-TARGET="$(cd "$TARGET" && pwd)"
-
-echo "================================================================"
-echo "       FlipSync -- Linux/macOS Real-Time Sync Client"
-echo "================================================================"
-echo "  Server:      $SERVER"
-echo "  Destination: $TARGET"
-if [[ -n "$TOKEN" ]]; then
-    echo "  Auth:        Bearer Token Configured"
-    TOKEN_QUERY="?token=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
-else
-    echo "  Auth:        None (Open Access)"
-    TOKEN_QUERY=""
-fi
-echo "================================================================"
+TOKEN_QUERY=""
 
 # URL-encodes a path component or file name for HTTP requests.
 url_encode() {
@@ -163,11 +127,56 @@ get_time_ms() {
     echo "$(( $(date +%s) * 1000 ))"
 }
 
+CURRENT_CURL_PID=""
+CURRENT_TMP_FILE=""
+CURRENT_CODE_FILE=""
+CURRENT_MANIFEST_FILE=""
+CURRENT_TMP_LIST=""
+CURRENT_CURL_ERR=""
+
+# Cleans up active background curl process and temporary download files.
+cleanup_download() {
+    if [[ -n "${CURRENT_CURL_PID:-}" ]]; then
+        kill "$CURRENT_CURL_PID" 2>/dev/null || true
+        CURRENT_CURL_PID=""
+    fi
+    if [[ -n "${CURRENT_TMP_FILE:-}" && -f "${CURRENT_TMP_FILE:-}" ]]; then
+        rm -f "$CURRENT_TMP_FILE" 2>/dev/null || true
+        CURRENT_TMP_FILE=""
+    fi
+    if [[ -n "${CURRENT_CODE_FILE:-}" && -f "${CURRENT_CODE_FILE:-}" ]]; then
+        rm -f "$CURRENT_CODE_FILE" 2>/dev/null || true
+        CURRENT_CODE_FILE=""
+    fi
+    if [[ -n "${CURRENT_MANIFEST_FILE:-}" && -f "${CURRENT_MANIFEST_FILE:-}" ]]; then
+        rm -f "$CURRENT_MANIFEST_FILE" 2>/dev/null || true
+        CURRENT_MANIFEST_FILE=""
+    fi
+    if [[ -n "${CURRENT_TMP_LIST:-}" && -f "${CURRENT_TMP_LIST:-}" ]]; then
+        rm -f "$CURRENT_TMP_LIST" 2>/dev/null || true
+        CURRENT_TMP_LIST=""
+    fi
+    if [[ -n "${CURRENT_CURL_ERR:-}" && -f "${CURRENT_CURL_ERR:-}" ]]; then
+        rm -f "$CURRENT_CURL_ERR" 2>/dev/null || true
+        CURRENT_CURL_ERR=""
+    fi
+}
+trap 'cleanup_download; exit 130' INT
+trap 'cleanup_download; exit 143' TERM
+trap cleanup_download EXIT
+
+# Sanitizes a string for safe terminal display by stripping ANSI escapes and control chars.
+sanitize_for_terminal() {
+    local str="$1"
+    printf "%s" "$str" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -c '[:print:]' '?'
+}
+
 # Verifies HTTP status code and terminates process on auth errors.
 check_auth() {
     local code="$1"
     local ctx="${2:-}"
     if [[ "$code" == "401" || "$code" == "403" ]]; then
+        cleanup_download
         echo "[CLIENT] [FATAL] Authentication failed${ctx:+ $ctx} (HTTP $code). A valid bearer token is required." >&2
         exit 1
     fi
@@ -186,13 +195,16 @@ curl_fetch() {
 # Formats a single-line progress indicator clamped to terminal width.
 format_progress_line() {
     local prefix="$1"
-    local filename="$2"
+    local raw_filename="$2"
     local pct="$3"
     local cur="$4"
     local tot="$5"
     local spd="$6"
     local eta="$7"
     local max_width="${8:-80}"
+
+    local filename
+    filename="$(sanitize_for_terminal "$raw_filename")"
 
     local limit=$(( max_width - 1 ))
     (( limit < 1 )) && limit=1
@@ -246,23 +258,7 @@ format_progress_line() {
     fi
 }
 
-CURRENT_CURL_PID=""
-CURRENT_TMP_FILE=""
 WAS_UPDATED=0
-
-# Cleans up active background curl process and temporary download files.
-cleanup_download() {
-    if [[ -n "${CURRENT_CURL_PID:-}" ]]; then
-        kill "$CURRENT_CURL_PID" 2>/dev/null || true
-        CURRENT_CURL_PID=""
-    fi
-    if [[ -n "${CURRENT_TMP_FILE:-}" && -f "${CURRENT_TMP_FILE:-}" ]]; then
-        rm -f "$CURRENT_TMP_FILE" 2>/dev/null || true
-        CURRENT_TMP_FILE=""
-    fi
-}
-trap 'cleanup_download; exit 130' INT
-trap 'cleanup_download; exit 143' TERM
 
 # Synchronizes a single file from host, downloading if hash differs.
 sync_file() {
@@ -293,6 +289,9 @@ sync_file() {
     enc_name="$(url_encode "$name")"
     local download_url="$SERVER/api/download/$enc_name$TOKEN_QUERY"
 
+    local display_name
+    display_name="$(sanitize_for_terminal "$name")"
+
     local is_tty=0
     [[ -t 1 ]] && is_tty=1
 
@@ -307,11 +306,10 @@ sync_file() {
         [[ ! "$cols" =~ ^[0-9]+$ || cols -le 0 ]] && cols=80
     fi
 
-    local code_file
-    code_file="$(mktemp)"
+    CURRENT_CODE_FILE="$(mktemp)"
     CURRENT_TMP_FILE="$tmp"
 
-    curl -s --connect-timeout 30 --speed-time 30 --speed-limit 100 -w "%{http_code}" -o "$tmp" "$download_url" > "$code_file" &
+    curl -s --connect-timeout 30 --speed-time 30 --speed-limit 100 -w "%{http_code}" -o "$tmp" "$download_url" > "$CURRENT_CODE_FILE" &
     CURRENT_CURL_PID=$!
 
     local start_time_ms
@@ -354,13 +352,13 @@ sync_file() {
                     eta_str="0s"
                 fi
                 local line
-                line="$(format_progress_line "$prefix" "$name" "$pct" "$cur_str" "$tot_str" "$spd_str" "$eta_str" "$cols")"
+                line="$(format_progress_line "$prefix" "$display_name" "$pct" "$cur_str" "$tot_str" "$spd_str" "$eta_str" "$cols")"
                 printf "\r%s" "$line"
             else
                 local cur_str
                 cur_str="$(format_bytes "$cur_bytes")"
                 local line
-                line="$(format_progress_line "$prefix" "$name" 0 "$cur_str" "" "$spd_str" "" "$cols")"
+                line="$(format_progress_line "$prefix" "$display_name" 0 "$cur_str" "" "$spd_str" "" "$cols")"
                 printf "\r%s" "$line"
             fi
         fi
@@ -370,13 +368,14 @@ sync_file() {
     CURRENT_CURL_PID=""
 
     local code
-    code="$(cat "$code_file" 2>/dev/null || echo "000")"
-    rm -f "$code_file"
+    code="$(cat "$CURRENT_CODE_FILE" 2>/dev/null || echo "000")"
+    rm -f "$CURRENT_CODE_FILE"
+    CURRENT_CODE_FILE=""
 
     if (( is_tty )); then
         local limit=$(( cols - 1 ))
         (( limit < 1 )) && limit=1
-        local verify_msg="${prefix} Verifying checksum for ${name}..."
+        local verify_msg="${prefix} Verifying checksum for ${display_name}..."
         if (( ${#verify_msg} > limit )); then
             verify_msg="${verify_msg:0:$limit}"
         fi
@@ -386,18 +385,18 @@ sync_file() {
         printf "\r%s%s" "$verify_msg" "$pad_str"
     fi
 
-    check_auth "$code" "downloading $name"
+    check_auth "$code" "downloading $display_name"
     if [[ "$code" != "200" ]]; then
         rm -f "$tmp"
         CURRENT_TMP_FILE=""
-        echo "[ERROR] Download failed for $name (HTTP $code)" >&2
+        echo "[ERROR] Download failed for $display_name (HTTP $code)" >&2
         return 1
     fi
 
     if [[ "$(calc_sha256 "$tmp")" != "$expected_hash" ]]; then
         rm -f "$tmp"
         CURRENT_TMP_FILE=""
-        echo "[ERROR] Checksum mismatch for $name!" >&2
+        echo "[ERROR] Checksum mismatch for $display_name!" >&2
         return 1
     fi
 
@@ -430,15 +429,17 @@ sync_file() {
         printf "\r%s\r" "$blank"
     fi
 
-    echo "[$(date +%T)] $prefix Received $name ($final_str) in $time_str ($final_spd_str) -> $dest"
+    echo "[$(date +%T)] $prefix Received $display_name ($final_str) in $time_str ($final_spd_str) -> $dest"
 }
 
 # Fetches remote manifest and synchronizes all listed files.
 sync_manifest() {
     local tmp_manifest
     tmp_manifest="$(mktemp)"
-    if ! curl_fetch "$SERVER/api/manifest$TOKEN_QUERY" "$tmp_manifest"; then
+    CURRENT_MANIFEST_FILE="$tmp_manifest"
+    if ! curl_fetch "$SERVER/api/manifest$TOKEN_QUERY" "$tmp_manifest" "fetching manifest"; then
         rm -f "$tmp_manifest"
+        CURRENT_MANIFEST_FILE=""
         echo "[CLIENT] [ERROR] Manifest request failed" >&2
         [[ "$ONCE" == "true" ]] && exit 1
         return 1
@@ -446,6 +447,7 @@ sync_manifest() {
 
     local tmp_list
     tmp_list="$(mktemp)"
+    CURRENT_TMP_LIST="$tmp_list"
     node -e '
         const manifest = JSON.parse(process.argv[1]);
         for (const [name, meta] of Object.entries(manifest.files || {})) {
@@ -453,6 +455,7 @@ sync_manifest() {
         }
     ' "$(cat "$tmp_manifest")" > "$tmp_list"
     rm -f "$tmp_manifest"
+    CURRENT_MANIFEST_FILE=""
 
     local total_files=0
     if [[ -s "$tmp_list" ]]; then
@@ -471,54 +474,101 @@ sync_manifest() {
         fi
     done < "$tmp_list"
     rm -f "$tmp_list"
+    CURRENT_TMP_LIST=""
 
     echo "[CLIENT] Remote check: $total_files file(s) verified, $updated updated."
 }
 
-# Initial synchronization
-sync_manifest
+run_main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --server|-s) SERVER="$2"; shift 2 ;;
+            --token|-t) TOKEN="$2"; shift 2 ;;
+            --target) TARGET="$2"; shift 2 ;;
+            --once) ONCE=true; shift ;;
+            --help|-h)
+                echo "Usage: ./sync-client.sh --server <URL> [--token <TOKEN>] [--target <FOLDER>] [--once]"
+                exit 0
+                ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
 
-if [[ "$ONCE" == "true" ]]; then
-    echo "[CLIENT] Sync complete (--once). Exiting."
-    exit 0
-fi
-
-echo "[CLIENT] Listening for real-time file updates..."
-
-BACKOFF=1
-MAX_BACKOFF=30
-
-while true; do
-    if [[ $BACKOFF -gt $MAX_BACKOFF ]]; then
-        echo "[CLIENT] [FATAL] Connection lost. Retry timer (${BACKOFF}s) exceeded limit (${MAX_BACKOFF}s). Terminating." >&2
+    if [[ -z "$SERVER" ]]; then
+        echo "Usage: ./sync-client.sh --server <URL> [--token <TOKEN>] [--target <FOLDER>] [--once]"
         exit 1
     fi
 
-    curl_err="$(mktemp)"
-    curl -N -sS -f -H "Accept: text/event-stream" "$SERVER/api/events$TOKEN_QUERY" 2>"$curl_err" | while read -r line; do
-        if [[ "$line" =~ ^event:[[:space:]]*file_changed ]]; then
-            read -r data_line
-            if [[ "$data_line" =~ ^data:[[:space:]]*(.*) ]]; then
-                node -e '
-                    const d = JSON.parse(process.argv[1]);
-                    if (d.file) console.log(`${d.file.name}\t${d.file.sha256}\t${d.file.size}`);
-                ' "${BASH_REMATCH[1]}" | while IFS=$'\t' read -r fname fhash fsize; do
-                    sync_file "$fname" "$fhash" "${fsize:-0}" 1 1
-                done
-            fi
+    SERVER="${SERVER%/}"
+    mkdir -p "$TARGET"
+    TARGET="$(cd "$TARGET" && pwd)"
+
+    echo "================================================================"
+    echo "       FlipSync -- Linux/macOS Real-Time Sync Client"
+    echo "================================================================"
+    echo "  Server:      $SERVER"
+    echo "  Destination: $TARGET"
+    if [[ -n "$TOKEN" ]]; then
+        echo "  Auth:        Bearer Token Configured"
+        TOKEN_QUERY="?token=$(node -e "console.log(encodeURIComponent(process.argv[1]))" "$TOKEN" 2>/dev/null || echo "$TOKEN")"
+    else
+        echo "  Auth:        None (Open Access)"
+        TOKEN_QUERY=""
+    fi
+    echo "================================================================"
+
+    # Initial synchronization
+    sync_manifest
+
+    if [[ "$ONCE" == "true" ]]; then
+        echo "[CLIENT] Sync complete (--once). Exiting."
+        exit 0
+    fi
+
+    echo "[CLIENT] Listening for real-time file updates..."
+
+    BACKOFF=1
+    MAX_BACKOFF=30
+
+    while true; do
+        if [[ $BACKOFF -gt $MAX_BACKOFF ]]; then
+            echo "[CLIENT] [FATAL] Connection lost. Retry timer (${BACKOFF}s) exceeded limit (${MAX_BACKOFF}s). Terminating." >&2
+            exit 1
         fi
-    done || true
 
-    err_output="$(cat "$curl_err" 2>/dev/null || echo "")"
-    rm -f "$curl_err"
+        local curl_err
+        curl_err="$(mktemp)"
+        CURRENT_CURL_ERR="$curl_err"
+        curl -N -sS -f -H "Accept: text/event-stream" "$SERVER/api/events$TOKEN_QUERY" 2>"$CURRENT_CURL_ERR" | while read -r line; do
+            if [[ "$line" =~ ^event:[[:space:]]*file_changed ]]; then
+                read -r data_line
+                if [[ "$data_line" =~ ^data:[[:space:]]*(.*) ]]; then
+                    node -e '
+                        const d = JSON.parse(process.argv[1]);
+                        if (d.file) console.log(`${d.file.name}\t${d.file.sha256}\t${d.file.size}`);
+                    ' "${BASH_REMATCH[1]}" | while IFS=$'\t' read -r fname fhash fsize; do
+                        sync_file "$fname" "$fhash" "${fsize:-0}" 1 1
+                    done
+                fi
+            fi
+        done || true
 
-    if [[ "$err_output" =~ 401|403 ]]; then
-        echo "[CLIENT] [FATAL] Authentication failed on event stream. A valid bearer token is required." >&2
-        exit 1
-    fi
+        err_output="$(cat "$CURRENT_CURL_ERR" 2>/dev/null || echo "")"
+        rm -f "$CURRENT_CURL_ERR"
+        CURRENT_CURL_ERR=""
 
-    echo "[CLIENT] Connection interrupted. Reconnecting in ${BACKOFF}s..."
-    sleep "$BACKOFF"
-    BACKOFF=$(( BACKOFF * 2 ))
-    sync_manifest || true
-done
+        if [[ "$err_output" =~ 401|403 ]]; then
+            echo "[CLIENT] [FATAL] Authentication failed on event stream. A valid bearer token is required." >&2
+            exit 1
+        fi
+
+        echo "[CLIENT] Connection interrupted. Reconnecting in ${BACKOFF}s..."
+        sleep "$BACKOFF"
+        BACKOFF=$(( BACKOFF * 2 ))
+        sync_manifest || true
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    run_main "$@"
+fi

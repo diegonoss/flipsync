@@ -131,6 +131,17 @@ function Get-ProgressBar {
 
 <#
 .SYNOPSIS
+    Strips ANSI escape sequences and replaces control characters for safe terminal output.
+#>
+function Sanitize-ForTerminal {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    $stripped = [regex]::Replace($Text, '\x1b\[[0-9;]*[a-zA-Z]', '')
+    return [regex]::Replace($stripped, '[\x00-\x1f\x7f-\x9f]', '?')
+}
+
+<#
+.SYNOPSIS
     Formats a single-line progress indicator clamped to terminal width.
 #>
 function Format-ProgressLine {
@@ -146,6 +157,7 @@ function Format-ProgressLine {
     )
 
     $limit = if ($MaxWidth -gt 1) { $MaxWidth - 1 } else { 1 }
+    $safeName = Sanitize-ForTerminal $FileName
     $pctStr = "{0,3}" -f $Percent
 
     $stats = if ($TotStr) {
@@ -166,16 +178,16 @@ function Format-ProgressLine {
 
     $tail = "$barStr$stats"
     $avail = $limit - $Prefix.Length - 1 - $tail.Length
-    $name = $FileName
+    $name = $safeName
     if ($name.Length -gt $avail) {
         if ($avail -ge 7) {
             $left = [int](($avail - 3) / 2)
             $right = $avail - 3 - $left
-            $name = $FileName.Substring(0, $left) + "..." + $FileName.Substring($FileName.Length - $right)
+            $name = $safeName.Substring(0, $left) + "..." + $safeName.Substring($safeName.Length - $right)
         } elseif ($avail -ge 4) {
-            $name = $FileName.Substring(0, $avail - 3) + "..."
+            $name = $safeName.Substring(0, $avail - 3) + "..."
         } elseif ($avail -gt 0) {
-            $name = $FileName.Substring(0, $avail)
+            $name = $safeName.Substring(0, $avail)
         } else {
             $name = ""
         }
@@ -249,6 +261,7 @@ function Sync-File {
         }
     }
 
+    $displayName = Sanitize-ForTerminal $FileName
     $prefix = "[SYNC]"
     if ($TotalFiles -gt 1 -and $Index -gt 0) {
         $prefix = "[SYNC] [$Index/$TotalFiles]"
@@ -345,7 +358,7 @@ function Sync-File {
 
         if ($isInteractive) {
             $limit = if ($cols -gt 1) { $cols - 1 } else { 1 }
-            $verifyMsg = "$prefix Verifying checksum for $FileName..."
+            $verifyMsg = "$prefix Verifying checksum for $displayName..."
             if ($verifyMsg.Length -gt $limit) {
                 $verifyMsg = $verifyMsg.Substring(0, $limit)
             } else {
@@ -363,7 +376,7 @@ function Sync-File {
         $downloadedHash = Get-FileSha256 -FilePath $tempFile
         if ($downloadedHash -ne $ExpectedHash) {
             Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-            Write-Host "`n[ERROR] Checksum mismatch for $FileName! Expected $ExpectedHash, got $downloadedHash" -ForegroundColor Red
+            Write-Host "`n[ERROR] Checksum mismatch for $displayName! Expected $ExpectedHash, got $downloadedHash" -ForegroundColor Red
             return $false
         }
 
@@ -387,15 +400,15 @@ function Sync-File {
         $finalSpeedStr = Format-Speed $avgSpeed
         $timeStr = if ($sw.ElapsedMilliseconds -lt 1000) { "$($sw.ElapsedMilliseconds)ms" } else { "{0:N1}s" -f $totalDurSec }
 
-        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $prefix Received $FileName ($finalSizeStr) in $timeStr ($finalSpeedStr) -> $dest" -ForegroundColor Green
+        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $prefix Received $displayName ($finalSizeStr) in $timeStr ($finalSpeedStr) -> $dest" -ForegroundColor Green
         return $true
     } catch {
         if ($fileStream) { $fileStream.Dispose(); $fileStream = $null }
         if ($responseStream) { $responseStream.Dispose(); $responseStream = $null }
         if ($response) { $response.Dispose(); $response = $null }
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-        Check-AuthError $_ "downloading $FileName"
-        Write-Host "`n[ERROR] Failed downloading $($FileName): $_" -ForegroundColor Red
+        Check-AuthError $_ "downloading $displayName"
+        Write-Host "`n[ERROR] Failed downloading $($displayName): $_" -ForegroundColor Red
         return $false
     }
 }
