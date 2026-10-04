@@ -66,8 +66,14 @@ export class SyncClient {
             const manifest = (await res.json()) as SyncManifest;
             const files = Object.values(manifest.files || {});
 
-            const results = await Promise.all(files.map((file) => this.downloadIfChanged(file)));
-            const syncedCount = results.filter(Boolean).length;
+            let syncedCount = 0;
+            const CONCURRENCY = 4;
+            for (let i = 0; i < files.length && this.isRunning; i += CONCURRENCY) {
+                const results = await Promise.all( // NOSONAR
+                    files.slice(i, i + CONCURRENCY).map((file) => this.downloadIfChanged(file))
+                );
+                syncedCount += results.filter(Boolean).length;
+            }
 
             if (this.verbose) {
                 console.log(`[CLIENT] Verified ${files.length} remote file(s). ${syncedCount} downloaded/updated.`);
