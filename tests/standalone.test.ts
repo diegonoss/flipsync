@@ -1,12 +1,116 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { exec } from "node:child_process";
+import { exec, spawn, spawnSync } from "node:child_process";
 import { SyncServer } from "../src/server.js";
+// @ts-ignore - standalone script ESM exports
+import { Client, formatProgressLine, getProgressBar, sanitizeForTerminal } from "../scripts/sync-client.js";
+
+function getPowerShellCmd(): string | null {
+    const candidates = process.platform === "win32"
+        ? ["pwsh.exe", "powershell.exe", "pwsh", "powershell"]
+        : ["pwsh", "powershell"];
+    for (const cmd of candidates) {
+        try {
+            const res = spawnSync(process.platform === "win32" ? "where" : "which", [cmd], { stdio: "ignore" });
+            if (res.status === 0) return cmd;
+        } catch {}
+    }
+    return null;
+}
+
+function isPythonPtyAvailable(): boolean {
+    if (process.platform === "win32") return false;
+    try {
+        const res = spawnSync("python3", ["-c", "import pty, termios, fcntl"], { stdio: "ignore" });
+        return res.status === 0;
+    } catch {
+        return false;
+    }
+}
+
+function runInPty(args: string[], cols = 80, rows = 24): Promise<{ code: number; output: string }> {
+    return new Promise((resolve, reject) => {
+        const pyScript = `
+import pty, os, struct, fcntl, termios, subprocess, sys, json
+cols = int(sys.argv[1])
+rows = int(sys.argv[2])
+cmd = json.loads(sys.argv[3])
+master, slave = pty.openpty()
+winsize = struct.pack("HHHH", rows, cols, 0, 0)
+fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
+p = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+out = b""
+while True:
+    try:
+        chunk = os.read(master, 1024)
+        if not chunk: break
+        out += chunk
+    except OSError:
+        break
+os.close(master)
+p.wait()
+sys.stdout.buffer.write(out)
+sys.exit(p.returncode)
+`;
+        const proc = spawn("python3", ["-c", pyScript, String(cols), String(rows), JSON.stringify(args)]);
+        let stdout = "";
+        proc.stdout.on("data", (d) => { stdout += d.toString(); });
+        proc.on("close", (code) => {
+            resolve({ code: code ?? 0, output: stdout });
+        });
+        proc.on("error", reject);
+    });
+}
 
 export async function testStandaloneClients(): Promise<void> {
     console.log("  [TEST] Standalone Script Clients (JS & Bash)");
+
+    // 0. Terminal progress formatting, width clamping, and sanitization tests
+    assert.equal(sanitizeForTerminal("\x1b[31mhello\x1b[0m\r\n\tworld"), "hello???world");
+    assert.equal(getProgressBar(0, 10), "          ");
+    assert.equal(getProgressBar(50, 10), "====>     ");
+    assert.equal(getProgressBar(100, 10), "==========");
+
+    for (const width of [10, 20, 35, 80]) {
+        const line = formatProgressLine("[SYNC]", "test-file.txt", 45, "500 KB", "1.1 MB", "200 KB/s", "3s", width);
+        const expectedLimit = Math.max(1, width - 1);
+        assert.ok(line.length <= expectedLimit, `Line length ${line.length} exceeds expected limit ${expectedLimit} at width ${width}`);
+    }
+
+    if (process.platform !== "win32") {
+        const bashTestScript = `
+            source scripts/sync-client.sh
+            raw=$(printf "hello\\033[31mcolor\\r\\nworld")
+            sanitized=$(sanitize_for_terminal "$raw")
+            echo "SAN:$sanitized"
+            for w in 20 35 80; do
+                line=$(format_progress_line "[SYNC]" "file.txt" 50 "50 KB" "100 KB" "10 KB/s" "5s" "$w")
+                echo "LEN:$w:\${#line}"
+            done
+        `;
+        const bashHelperOut = await new Promise<string>((resolve, reject) => {
+            const proc = spawn("bash", ["-c", bashTestScript]);
+            let stdout = "";
+            proc.stdout.on("data", (d) => { stdout += d.toString(); });
+            proc.on("close", (code) => {
+                if (code === 0) resolve(stdout);
+                else reject(new Error(`Bash helper test exited with code ${code}: ${stdout}`));
+            });
+            proc.on("error", reject);
+        });
+        assert.match(bashHelperOut, /SAN:hellocolor\?\?world/);
+        for (const match of bashHelperOut.matchAll(/LEN:(\d+):(\d+)/g)) {
+            const width = parseInt(match[1], 10);
+            const len = parseInt(match[2], 10);
+            const expectedLimit = Math.max(1, width - 1);
+            assert.ok(len <= expectedLimit, `Bash line length ${len} exceeds limit ${expectedLimit} for width ${width}`);
+        }
+    }
 
     const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-standalone-host-"));
     const clientDirJs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-standalone-client-js-"));
@@ -17,6 +121,7 @@ export async function testStandaloneClients(): Promise<void> {
     fs.writeFileSync(path.join(hostDir, "La_ecuación_de_Samuel.mp3"), "accent-data");
     fs.mkdirSync(path.join(hostDir, "sub/deep"), { recursive: true });
     fs.writeFileSync(path.join(hostDir, "sub/deep/file.txt"), "nested-data");
+    fs.writeFileSync(path.join(hostDir, "large.dat"), Buffer.alloc(128 * 1024, "z"));
 
     const server = new SyncServer({
         port: 0,
@@ -32,6 +137,7 @@ export async function testStandaloneClients(): Promise<void> {
     try {
         // 1. Standalone sync-client.js
         const jsScript = path.resolve("scripts/sync-client.js");
+        let jsStdout = "";
         await new Promise<void>((resolve, reject) => {
             exec(
                 `node "${jsScript}" --server "${localUrl}" --token "${token}" --target "${clientDirJs}" --once`,
@@ -39,13 +145,18 @@ export async function testStandaloneClients(): Promise<void> {
                     if (err) {
                         reject(new Error(`JS Client failed: ${err.message}\n${stdout}\n${stderr}`));
                     } else {
+                        jsStdout = stdout;
                         resolve();
                     }
                 }
             );
         });
 
+        assert.match(jsStdout, /Received data\.json/);
+        assert.match(jsStdout, /\/s/);
         assert.ok(fs.existsSync(path.join(clientDirJs, "data.json")));
+        assert.ok(fs.existsSync(path.join(clientDirJs, "large.dat")));
+        assert.equal(fs.statSync(path.join(clientDirJs, "large.dat")).size, 128 * 1024);
         const jsData = JSON.parse(fs.readFileSync(path.join(clientDirJs, "data.json"), "utf8"));
         assert.equal(jsData.message, "hello standalone");
         assert.ok(fs.existsSync(path.join(clientDirJs, "La_ecuación_de_Samuel.mp3")));
@@ -53,9 +164,33 @@ export async function testStandaloneClients(): Promise<void> {
         assert.ok(fs.existsSync(path.join(clientDirJs, "sub/deep/file.txt")));
         assert.equal(fs.readFileSync(path.join(clientDirJs, "sub/deep/file.txt"), "utf8"), "nested-data");
 
+        // 1b. Standalone sync-client.js executed via symlink
+        if (process.platform !== "win32") {
+            const symlinkDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-symlink-"));
+            const symlinkScript = path.join(symlinkDir, "symlink-sync-client.js");
+            const symlinkTarget = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-symlink-target-"));
+            try {
+                fs.symlinkSync(jsScript, symlinkScript);
+                await new Promise<void>((resolve, reject) => {
+                    exec(
+                        `node "${symlinkScript}" --server "${localUrl}" --token "${token}" --target "${symlinkTarget}" --once`,
+                        (err, stdout, stderr) => {
+                            if (err) reject(new Error(`Symlinked JS client failed: ${err.message}\n${stdout}\n${stderr}`));
+                            else resolve();
+                        }
+                    );
+                });
+                assert.ok(fs.existsSync(path.join(symlinkTarget, "data.json")));
+            } finally {
+                fs.rmSync(symlinkDir, { recursive: true, force: true });
+                fs.rmSync(symlinkTarget, { recursive: true, force: true });
+            }
+        }
+
         // 2. Standalone sync-client.sh (if bash is available)
         if (process.platform !== "win32") {
             const shScript = path.resolve("scripts/sync-client.sh");
+            let bashStdout = "";
             await new Promise<void>((resolve, reject) => {
                 exec(
                     `bash "${shScript}" --server "${localUrl}" --token "${token}" --target "${clientDirBash}" --once`,
@@ -63,13 +198,18 @@ export async function testStandaloneClients(): Promise<void> {
                         if (err) {
                             reject(new Error(`Bash Client failed: ${err.message}\n${stdout}\n${stderr}`));
                         } else {
+                            bashStdout = stdout;
                             resolve();
                         }
                     }
                 );
             });
 
+            assert.match(bashStdout, /Received data\.json/);
+            assert.match(bashStdout, /\/s/);
             assert.ok(fs.existsSync(path.join(clientDirBash, "data.json")));
+            assert.ok(fs.existsSync(path.join(clientDirBash, "large.dat")));
+            assert.equal(fs.statSync(path.join(clientDirBash, "large.dat")).size, 128 * 1024);
             const bashData = JSON.parse(fs.readFileSync(path.join(clientDirBash, "data.json"), "utf8"));
             assert.equal(bashData.message, "hello standalone");
             assert.ok(fs.existsSync(path.join(clientDirBash, "La_ecuación_de_Samuel.mp3")));
@@ -77,7 +217,106 @@ export async function testStandaloneClients(): Promise<void> {
             assert.ok(fs.existsSync(path.join(clientDirBash, "sub/deep/file.txt")));
             assert.equal(fs.readFileSync(path.join(clientDirBash, "sub/deep/file.txt"), "utf8"), "nested-data");
         }
-        // 3. Verify standalone clients terminate immediately on 401 when token is missing
+
+        // 2b. Standalone sync-client.ps1 (if pwsh/powershell is available)
+        const psCmd = getPowerShellCmd();
+        if (psCmd) {
+            const clientDirPs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-standalone-client-ps-"));
+            const psScript = path.resolve("scripts/sync-client.ps1");
+            try {
+                let psStdout = "";
+                await new Promise<void>((resolve, reject) => {
+                    const proc = spawn(psCmd, [
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass",
+                        "-File", psScript,
+                        "-Server", localUrl,
+                        "-Token", token,
+                        "-Target", clientDirPs,
+                        "-Once"
+                    ]);
+                    proc.stdout.on("data", (d) => { psStdout += d.toString(); });
+                    proc.stderr.on("data", (d) => { psStdout += d.toString(); });
+                    proc.on("close", (code) => {
+                        if (code === 0) resolve();
+                        else reject(new Error(`PowerShell Client failed with exit code ${code}:\n${psStdout}`));
+                    });
+                    proc.on("error", reject);
+                });
+
+                assert.match(psStdout, /Received data\.json/);
+                assert.ok(fs.existsSync(path.join(clientDirPs, "data.json")));
+                assert.ok(fs.existsSync(path.join(clientDirPs, "large.dat")));
+                const psData = JSON.parse(fs.readFileSync(path.join(clientDirPs, "data.json"), "utf8"));
+                assert.equal(psData.message, "hello standalone");
+            } finally {
+                fs.rmSync(clientDirPs, { recursive: true, force: true });
+            }
+
+            // 2c. PowerShell authentication failure termination (HTTP 401/403 after response disposal)
+            const clientDirPsAuth = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-standalone-client-ps-auth-"));
+            try {
+                let psAuthStdout = "";
+                let psAuthCode: number | null = null;
+                await new Promise<void>((resolve) => {
+                    const proc = spawn(psCmd, [
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass",
+                        "-File", psScript,
+                        "-Server", localUrl,
+                        "-Token", "bad-token",
+                        "-Target", clientDirPsAuth,
+                        "-Once"
+                    ]);
+                    proc.stdout.on("data", (d) => { psAuthStdout += d.toString(); });
+                    proc.stderr.on("data", (d) => { psAuthStdout += d.toString(); });
+                    proc.on("close", (code) => {
+                        psAuthCode = code;
+                        resolve();
+                    });
+                    proc.on("error", () => resolve());
+                });
+
+                assert.notEqual(psAuthCode, 0, "Expected non-zero exit code on PowerShell auth failure");
+                assert.match(psAuthStdout, /Authentication failed/i);
+            } finally {
+                fs.rmSync(clientDirPsAuth, { recursive: true, force: true });
+            }
+        }
+
+        // 3. Pseudo-Terminal (PTY) execution for real-time progress verification (POSIX only with python3 pty)
+        if (isPythonPtyAvailable()) {
+            const ptyClientDirJs = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-js-"));
+            const ptyClientDirBash = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-pty-bash-"));
+            try {
+                const jsPty = await runInPty(
+                    ["node", jsScript, "--server", localUrl, "--token", token, "--target", ptyClientDirJs, "--once"],
+                    35
+                );
+                assert.equal(jsPty.code, 0, `JS client in PTY failed: ${jsPty.output}`);
+                assert.match(jsPty.output, /\r.*%.*(B|KB|MB)\/s/);
+                assert.match(jsPty.output, /Received data\.json/);
+                assert.ok(fs.existsSync(path.join(ptyClientDirJs, "data.json")));
+                assert.ok(fs.existsSync(path.join(ptyClientDirJs, "large.dat")));
+
+                const bashPty = await runInPty(
+                    ["bash", path.resolve("scripts/sync-client.sh"), "--server", localUrl, "--token", token, "--target", ptyClientDirBash, "--once"],
+                    35
+                );
+                assert.equal(bashPty.code, 0, `Bash client in PTY failed: ${bashPty.output}`);
+                assert.match(bashPty.output, /\r.*%.*(B|KB|MB)\/s/);
+                assert.match(bashPty.output, /Received data\.json/);
+                assert.ok(fs.existsSync(path.join(ptyClientDirBash, "data.json")));
+                assert.ok(fs.existsSync(path.join(ptyClientDirBash, "large.dat")));
+            } finally {
+                fs.rmSync(ptyClientDirJs, { recursive: true, force: true });
+                fs.rmSync(ptyClientDirBash, { recursive: true, force: true });
+            }
+        }
+
+        // 4. Verify standalone clients terminate immediately on 401 when token is missing
         const expectAuthFailure = (cmd: string) =>
             new Promise<void>((resolve, reject) => {
                 exec(cmd, (err, _stdout, stderr) => {
@@ -90,7 +329,420 @@ export async function testStandaloneClients(): Promise<void> {
 
         await expectAuthFailure(`node "${jsScript}" --server "${localUrl}" --target "${clientDirJs}"`);
         if (process.platform !== "win32") {
-            await expectAuthFailure(`bash "${path.resolve("scripts/sync-client.sh")}" --server "${localUrl}" --target "${clientDirBash}"`);
+            const badDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-clean-"));
+            try {
+                await expectAuthFailure(`bash "${path.resolve("scripts/sync-client.sh")}" --server "${localUrl}" --target "${badDir}"`);
+                const remainingFiles = fs.readdirSync(badDir);
+                const tempArtifacts = remainingFiles.filter((f) => f.includes(".tmp."));
+                assert.equal(tempArtifacts.length, 0, `Found dangling temporary files after auth failure: ${tempArtifacts.join(", ")}`);
+            } finally {
+                fs.rmSync(badDir, { recursive: true, force: true });
+            }
+        }
+
+        // 5. Verify Client.stop() rejects queued download promises promptly
+        const mockStopDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-stop-"));
+        try {
+            const mockClient = new Client({
+                server: localUrl,
+                token,
+                target: mockStopDir,
+                once: false
+            });
+            mockClient.running = true;
+            let resolveFirst: ((val: boolean) => void) | null = null;
+            mockClient.downloadIfChanged = () => new Promise<boolean>((resolve) => { resolveFirst = resolve; });
+
+            const p1 = mockClient.queueFile({ name: "file1.txt", sha256: "h1", size: 10 });
+            const p2 = mockClient.queueFile({ name: "file2.txt", sha256: "h2", size: 20 });
+            assert.equal(mockClient.downloadQueue.length, 1);
+
+            mockClient.stop();
+            assert.equal(mockClient.running, false);
+
+            await assert.rejects(p2, /Client stopped/);
+            if (resolveFirst) (resolveFirst as (val: boolean) => void)(true);
+            assert.equal(await p1, true);
+        } finally {
+            fs.rmSync(mockStopDir, { recursive: true, force: true });
+        }
+
+        // 5b. Verify Client.stop() cancels overlapping queued and reconnect downloads promptly without partial writes
+        let sseConnRes: http.ServerResponse | null = null;
+        let sseClosed = false;
+        const serverSockets = new Set<any>();
+
+        const overlapServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                sseConnRes = res;
+                res.writeHead(200, {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    Connection: "keep-alive"
+                });
+                res.write("event: file_changed\ndata: {\"file\":{\"name\":\"fileA.bin\",\"sha256\":\"hashA\",\"size\":1000}}\n\n");
+            } else if (req.url?.includes("/api/download/fileA.bin")) {
+                res.writeHead(200, {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": "1000"
+                });
+                res.write("chunkA");
+                // Trigger SSE drop to initiate reconnect while fileA is stalled
+                if (sseConnRes && !sseClosed) {
+                    sseClosed = true;
+                    sseConnRes.end();
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "fileB.bin": { name: "fileB.bin", sha256: "hashB", size: 1000 }
+                    }
+                }));
+            } else if (req.url?.includes("/api/download/fileB.bin")) {
+                res.writeHead(200, {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": "1000"
+                });
+                res.write("chunkB");
+                // Stall fileB without ending
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        overlapServer.on("connection", (socket) => {
+            serverSockets.add(socket);
+            socket.on("close", () => serverSockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => overlapServer.listen(0, "127.0.0.1", () => resolve()));
+        const overlapPort = (overlapServer.address() as any).port;
+        const overlapUrl = `http://127.0.0.1:${overlapPort}`;
+
+        const overlapTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-overlap-"));
+        try {
+            const overlapClient = new Client({
+                server: overlapUrl,
+                target: overlapTargetDir,
+                once: false,
+                reconnectDelay: 20
+            });
+            overlapClient.running = true;
+            overlapClient.connectSse(20);
+
+            // Wait until both download A and download B are in flight (activeDownloadReqs.size >= 2)
+            for (let i = 0; i < 50; i++) {
+                if (overlapClient.activeDownloadReqs.size >= 2) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.equal(overlapClient.activeDownloadReqs.size, 2, "Expected both fileA and fileB downloads active simultaneously");
+
+            const queuedFilePromise = overlapClient.lastFilePromise;
+            const reconnectPromise = overlapClient.activeSyncPromise;
+
+            overlapClient.stop();
+            assert.equal(overlapClient.running, false);
+            assert.equal(overlapClient.activeDownloadReqs.size, 0);
+            assert.equal(overlapClient.activeDownloadReq, null);
+
+            // Assert both operations settle as stopped
+            if (queuedFilePromise) {
+                await assert.rejects(queuedFilePromise, /Client stopped/);
+            }
+            if (reconnectPromise) {
+                await assert.rejects(reconnectPromise, /Client stopped/);
+            }
+
+            // Assert neither destination nor temporary file was written
+            assert.equal(fs.existsSync(path.join(overlapTargetDir, "fileA.bin")), false);
+            assert.equal(fs.existsSync(path.join(overlapTargetDir, "fileB.bin")), false);
+            const remainingFiles = fs.readdirSync(overlapTargetDir);
+            assert.equal(remainingFiles.length, 0, "Expected no files or temporary files in target directory");
+        } finally {
+            for (const sock of serverSockets) sock.destroy();
+            await new Promise<void>((r) => overlapServer.close(() => r()));
+            fs.rmSync(overlapTargetDir, { recursive: true, force: true });
+        }
+
+        // 5c. Verify non-200 responses are consumed/destroyed promptly without leaking sockets or references
+        const errResList: http.ServerResponse[] = [];
+        const errServer = http.createServer((req, res) => {
+            errResList.push(res);
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.write("Internal server error body that remains open...");
+        });
+        await new Promise<void>((resolve) => errServer.listen(0, "127.0.0.1", () => resolve()));
+        const errPort = (errServer.address() as any).port;
+        const errUrl = `http://127.0.0.1:${errPort}`;
+
+        const errTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-err-"));
+        try {
+            const errClient = new Client({
+                server: errUrl,
+                target: errTargetDir,
+                once: false
+            });
+            errClient.running = true;
+
+            // Test httpDownload failure on 500 with unclosed body
+            for (let i = 0; i < 3; i++) {
+                await assert.rejects(
+                    errClient.httpDownload(`${errUrl}/download-fail-${i}`, `fail-${i}.bin`),
+                    /HTTP 500/
+                );
+                assert.equal(errClient.activeDownloadReqs.size, 0, "Expected no activeDownloadReqs after rejection");
+                assert.equal(errClient.activeDownloadReq, null);
+            }
+
+            // Test httpReq with asBuffer = true failure on 500 with unclosed body
+            for (let i = 0; i < 3; i++) {
+                await assert.rejects(
+                    errClient.httpReq(`${errUrl}/buffer-fail-${i}`, true),
+                    /HTTP 500/
+                );
+                assert.equal(errClient.activeDownloadReqs.size, 0, "Expected no activeDownloadReqs after rejection");
+                assert.equal(errClient.activeDownloadReq, null);
+            }
+
+            // Verify server-side sockets for those responses were closed/destroyed
+            for (const sRes of errResList) {
+                for (let i = 0; i < 20; i++) {
+                    if (sRes.socket?.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 20));
+                }
+                assert.equal(sRes.socket?.destroyed, true, "Expected socket to be destroyed on client rejection");
+            }
+        } finally {
+            await new Promise<void>((r) => errServer.close(() => r()));
+            fs.rmSync(errTargetDir, { recursive: true, force: true });
+        }
+
+        // 5d. Verify stale same-file downloads during reconnect are superseded and do not overwrite newer content
+        let sse5dRes: http.ServerResponse | null = null;
+        let releaseH1: (() => void) | null = null;
+        const test5dSockets = new Set<any>();
+
+        const contentH1 = "content-v1-stale";
+        const hashH1 = crypto.createHash("sha256").update(contentH1).digest("hex");
+        const contentH2 = "content-v2-fresh";
+        const hashH2 = crypto.createHash("sha256").update(contentH2).digest("hex");
+
+        let h1Started = false;
+        let h2Finished = false;
+        let h1Emitted = false;
+
+        const staleRaceServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                sse5dRes = res;
+                res.writeHead(200, {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    Connection: "keep-alive"
+                });
+                if (!h1Emitted) {
+                    h1Emitted = true;
+                    res.write(`event: file_changed\ndata: {"file":{"name":"race.txt","sha256":"${hashH1}","size":${contentH1.length}}}\n\n`);
+                }
+            } else if (req.url?.includes("/api/download/race.txt")) {
+                if (!h1Started) {
+                    h1Started = true;
+                    res.writeHead(200, {
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": String(contentH1.length)
+                    });
+                    if (sse5dRes) {
+                        sse5dRes.end();
+                    }
+                    releaseH1 = () => {
+                        res.end(contentH1);
+                    };
+                } else {
+                    res.writeHead(200, {
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": String(contentH2.length)
+                    });
+                    res.end(contentH2);
+                    h2Finished = true;
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "race.txt": { name: "race.txt", sha256: hashH2, size: contentH2.length }
+                    }
+                }));
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        staleRaceServer.on("connection", (socket) => {
+            test5dSockets.add(socket);
+            socket.on("close", () => test5dSockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => staleRaceServer.listen(0, "127.0.0.1", () => resolve()));
+        const staleRacePort = (staleRaceServer.address() as any).port;
+        const staleRaceUrl = `http://127.0.0.1:${staleRacePort}`;
+
+        const staleRaceTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-stale-race-"));
+        try {
+            const staleClient = new Client({
+                server: staleRaceUrl,
+                target: staleRaceTargetDir,
+                once: false,
+                reconnectDelay: 20
+            });
+            staleClient.running = true;
+            staleClient.connectSse(20);
+
+            // Wait until H1 starts download and capture op1Promise
+            for (let i = 0; i < 50; i++) {
+                if (releaseH1) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.ok(releaseH1, "Expected releaseH1 callback to be set");
+            const op1Promise = staleClient.lastFilePromise;
+            assert.ok(op1Promise, "Expected op1Promise to be set");
+
+            // Wait until H2 completes from reconnect manifest
+            for (let i = 0; i < 50; i++) {
+                if (h2Finished) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.equal(h2Finished, true, "Expected H2 download to complete before H1 release");
+
+            // Destination must currently have H2
+            const destPath = path.join(staleRaceTargetDir, "race.txt");
+            assert.equal(fs.existsSync(destPath), true);
+            assert.equal(fs.readFileSync(destPath, "utf8"), contentH2);
+
+            // Now release stalled H1
+            (releaseH1 as () => void)();
+
+            // Wait for op1 to settle (reject with Superseded download)
+            await assert.rejects(op1Promise, /Superseded download/);
+
+            // Small delay to ensure any asynchronous operations completed
+            await new Promise((r) => setTimeout(r, 50));
+
+            // Assert destination STILL contains H2 and was not overwritten by H1
+            assert.equal(fs.readFileSync(destPath, "utf8"), contentH2);
+
+            // Assert no temporary files remain
+            const remaining = fs.readdirSync(staleRaceTargetDir).filter((f) => f.includes(".tmp."));
+            assert.equal(remaining.length, 0, "Expected no temporary files to remain");
+
+            staleClient.stop();
+        } finally {
+            for (const sock of test5dSockets) sock.destroy();
+            await new Promise<void>((r) => staleRaceServer.close(() => r()));
+            fs.rmSync(staleRaceTargetDir, { recursive: true, force: true });
+        }
+
+        // 5e. Verify rejected SSE responses (e.g. 503) are disposed and do not leak sockets or requests on reconnect
+        const sse503ResList: http.ServerResponse[] = [];
+        const sse503Sockets = new Set<any>();
+        let should503 = true;
+        let sse200Connected = false;
+
+        const sseFailServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                if (should503) {
+                    sse503ResList.push(res);
+                    res.writeHead(503, { "Content-Type": "text/plain" });
+                    res.write("Service Unavailable - body remains open...");
+                } else {
+                    res.writeHead(200, {
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        Connection: "keep-alive"
+                    });
+                    res.write("event: ping\ndata: {}\n\n");
+                    sse200Connected = true;
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ files: {} }));
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        sseFailServer.on("connection", (socket) => {
+            sse503Sockets.add(socket);
+            socket.on("close", () => sse503Sockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => sseFailServer.listen(0, "127.0.0.1", () => resolve()));
+        const sseFailPort = (sseFailServer.address() as any).port;
+        const sseFailUrl = `http://127.0.0.1:${sseFailPort}`;
+
+        const sseFailTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-sse-503-"));
+        try {
+            const failClient = new Client({
+                server: sseFailUrl,
+                target: sseFailTargetDir,
+                once: false,
+                reconnectDelay: 20
+            });
+            failClient.running = true;
+            failClient.connectSse(20);
+
+            // Wait until several 503 reconnect attempts have occurred
+            for (let i = 0; i < 50; i++) {
+                if (sse503ResList.length >= 3) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.ok(sse503ResList.length >= 3, "Expected at least 3 SSE 503 responses to be received");
+
+            // Stop client and verify no active request remains
+            failClient.stop();
+            assert.equal(failClient.activeReq, null, "Expected activeReq to be null after stop()");
+
+            // Assert every server socket from the 503 attempts is closed/destroyed
+            for (const sRes of sse503ResList) {
+                for (let i = 0; i < 25; i++) {
+                    if (sRes.socket?.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 20));
+                }
+                assert.equal(sRes.socket?.destroyed, true, "Expected 503 server socket to be destroyed");
+            }
+
+            // Now enable 200 responses and verify a later 200 response reconnects successfully
+            should503 = false;
+            failClient.running = true;
+            failClient.connectSse(20);
+
+            for (let i = 0; i < 50; i++) {
+                if (sse200Connected) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.equal(sse200Connected, true, "Expected client to reconnect successfully on 200");
+            assert.ok(failClient.activeReq, "Expected activeReq to be set during active 200 stream");
+
+            failClient.stop();
+        } finally {
+            for (const s of sse503Sockets) s.destroy();
+            await new Promise<void>((r) => sseFailServer.close(() => r()));
+            fs.rmSync(sseFailTargetDir, { recursive: true, force: true });
+        }
+
+        // 6. Verify terminal sanitization on path-traversal errors and destination logs
+        const mockSanitizeDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-sanlog-"));
+        try {
+            const rawEvil = "../\x1b[31mevil\x1b[0m\r\n.txt";
+            let capturedErr = "";
+            const origErr = console.error;
+            console.error = (...args: any[]) => { capturedErr += args.join(" "); };
+            try {
+                const sClient = new Client({ server: localUrl, token, target: mockSanitizeDir });
+                sClient.running = true;
+                await sClient.downloadIfChanged({ name: rawEvil, sha256: "xxx", size: 10 });
+            } finally {
+                console.error = origErr;
+            }
+            assert.ok(!capturedErr.includes("\x1b[31m"), "Error output contains raw ANSI escape sequence");
+            assert.ok(!capturedErr.includes("\r"), "Error output contains raw carriage return");
+            assert.ok(!capturedErr.includes("\n"), "Error output contains raw newline");
+            assert.match(capturedErr, /Path traversal blocked/);
+        } finally {
+            fs.rmSync(mockSanitizeDir, { recursive: true, force: true });
         }
     } finally {
         await server.stop();
