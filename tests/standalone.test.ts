@@ -637,6 +637,92 @@ export async function testStandaloneClients(): Promise<void> {
             fs.rmSync(staleRaceTargetDir, { recursive: true, force: true });
         }
 
+        // 5e. Verify rejected SSE responses (e.g. 503) are disposed and do not leak sockets or requests on reconnect
+        const sse503ResList: http.ServerResponse[] = [];
+        const sse503Sockets = new Set<any>();
+        let should503 = true;
+        let sse200Connected = false;
+
+        const sseFailServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                if (should503) {
+                    sse503ResList.push(res);
+                    res.writeHead(503, { "Content-Type": "text/plain" });
+                    res.write("Service Unavailable - body remains open...");
+                } else {
+                    res.writeHead(200, {
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        Connection: "keep-alive"
+                    });
+                    res.write("event: ping\ndata: {}\n\n");
+                    sse200Connected = true;
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ files: {} }));
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        sseFailServer.on("connection", (socket) => {
+            sse503Sockets.add(socket);
+            socket.on("close", () => sse503Sockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => sseFailServer.listen(0, "127.0.0.1", () => resolve()));
+        const sseFailPort = (sseFailServer.address() as any).port;
+        const sseFailUrl = `http://127.0.0.1:${sseFailPort}`;
+
+        const sseFailTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-sse-503-"));
+        try {
+            const failClient = new Client({
+                server: sseFailUrl,
+                target: sseFailTargetDir,
+                once: false,
+                reconnectDelay: 20
+            });
+            failClient.running = true;
+            failClient.connectSse(20);
+
+            // Wait until several 503 reconnect attempts have occurred
+            for (let i = 0; i < 50; i++) {
+                if (sse503ResList.length >= 3) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.ok(sse503ResList.length >= 3, "Expected at least 3 SSE 503 responses to be received");
+
+            // Stop client and verify no active request remains
+            failClient.stop();
+            assert.equal(failClient.activeReq, null, "Expected activeReq to be null after stop()");
+
+            // Assert every server socket from the 503 attempts is closed/destroyed
+            for (const sRes of sse503ResList) {
+                for (let i = 0; i < 25; i++) {
+                    if (sRes.socket?.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 20));
+                }
+                assert.equal(sRes.socket?.destroyed, true, "Expected 503 server socket to be destroyed");
+            }
+
+            // Now enable 200 responses and verify a later 200 response reconnects successfully
+            should503 = false;
+            failClient.running = true;
+            failClient.connectSse(20);
+
+            for (let i = 0; i < 50; i++) {
+                if (sse200Connected) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.equal(sse200Connected, true, "Expected client to reconnect successfully on 200");
+            assert.ok(failClient.activeReq, "Expected activeReq to be set during active 200 stream");
+
+            failClient.stop();
+        } finally {
+            for (const s of sse503Sockets) s.destroy();
+            await new Promise<void>((r) => sseFailServer.close(() => r()));
+            fs.rmSync(sseFailTargetDir, { recursive: true, force: true });
+        }
+
         // 6. Verify terminal sanitization on path-traversal errors and destination logs
         const mockSanitizeDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-sanlog-"));
         try {

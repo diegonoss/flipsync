@@ -443,12 +443,19 @@ class Client {
     connectSse(backoff = this.reconnectDelay || 1000) {
         if (!this.running) return;
 
+        if (this.activeReq) {
+            this.activeReq.destroy();
+            this.activeReq = null;
+        }
+
         if (backoff > 30000) {
             fatal(`Connection lost. Retry timer (${(backoff / 1000).toFixed(1)}s) exceeded limit (30.0s). Terminating.`);
         }
 
         const parsed = new URL(this.url("/api/events"));
         const transport = parsed.protocol === "https:" ? https : http;
+
+        let retried = false;
 
         const req = transport.request(
             parsed,
@@ -457,11 +464,24 @@ class Client {
             },
             (res) => {
                 if (res.statusCode === 401 || res.statusCode === 403) {
+                    if (this.activeReq === req) {
+                        this.activeReq = null;
+                    }
+                    res.resume();
+                    res.destroy();
+                    req.destroy();
                     fatal(`Authentication failed (HTTP ${res.statusCode}). A valid bearer token is required.`);
                 }
 
                 if (res.statusCode !== 200) {
                     console.error(`[CLIENT] [ERROR] SSE stream rejected: HTTP ${res.statusCode}`);
+                    retried = true;
+                    if (this.activeReq === req) {
+                        this.activeReq = null;
+                    }
+                    res.resume();
+                    res.destroy();
+                    req.destroy();
                     this.retry(backoff);
                     return;
                 }
@@ -481,6 +501,10 @@ class Client {
                 res.on("end", () => {
                     if (!this.running) return;
                     console.log("[CLIENT] Stream ended by host.");
+                    retried = true;
+                    if (this.activeReq === req) {
+                        this.activeReq = null;
+                    }
                     this.retry(backoff);
                 });
 
@@ -493,9 +517,18 @@ class Client {
 
         this.activeReq = req;
         req.on("error", (err) => {
-            if (!this.running) return;
+            if (retried || !this.running) return;
+            retried = true;
+            if (this.activeReq === req) {
+                this.activeReq = null;
+            }
             console.error(`[CLIENT] Connection error: ${err.message}. Retrying in ${(backoff / 1000).toFixed(1)}s...`);
             this.retry(backoff);
+        });
+        req.on("close", () => {
+            if (this.activeReq === req) {
+                this.activeReq = null;
+            }
         });
         req.end();
     }
