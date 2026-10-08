@@ -161,9 +161,25 @@ function Format-ProgressLine {
     $pctStr = "{0,3}" -f $Percent
 
     $stats = if ($TotStr) {
-        " $pctStr% ($CurStr / $TotStr) $SpeedStr ETA $EtaStr"
+        $fullStats = " $pctStr% ($CurStr / $TotStr) $SpeedStr ETA $EtaStr"
+        $compactStats = " $pctStr% $CurStr $SpeedStr"
+        $minStats = " $pctStr% $SpeedStr"
+        if ($limit -ge ($Prefix.Length + 1 + $fullStats.Length)) {
+            $fullStats
+        } elseif ($limit -ge ($Prefix.Length + 1 + $compactStats.Length)) {
+            $compactStats
+        } elseif ($limit -ge ($Prefix.Length + 1 + $minStats.Length)) {
+            $minStats
+        } else {
+            " $pctStr%"
+        }
     } else {
-        " $CurStr ($SpeedStr)"
+        $fullStats = " $CurStr ($SpeedStr)"
+        if ($limit -ge ($Prefix.Length + 1 + $fullStats.Length)) {
+            $fullStats
+        } else {
+            " $CurStr"
+        }
     }
 
     $overhead = $Prefix.Length + 1 + $stats.Length
@@ -243,8 +259,9 @@ function Sync-File {
         [int]$TotalFiles = 0
     )
 
+    $displayName = Sanitize-ForTerminal $FileName
     if ($FileName -like "*..*" -or [System.IO.Path]::IsPathRooted($FileName)) {
-        Write-Host "[ERROR] Path traversal blocked: $FileName" -ForegroundColor Red
+        Write-Host "[ERROR] Path traversal blocked: $displayName" -ForegroundColor Red
         return $false
     }
 
@@ -260,8 +277,6 @@ function Sync-File {
             return $false
         }
     }
-
-    $displayName = Sanitize-ForTerminal $FileName
     $prefix = "[SYNC]"
     if ($TotalFiles -gt 1 -and $Index -gt 0) {
         $prefix = "[SYNC] [$Index/$TotalFiles]"
@@ -400,7 +415,8 @@ function Sync-File {
         $finalSpeedStr = Format-Speed $avgSpeed
         $timeStr = if ($sw.ElapsedMilliseconds -lt 1000) { "$($sw.ElapsedMilliseconds)ms" } else { "{0:N1}s" -f $totalDurSec }
 
-        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $prefix Received $displayName ($finalSizeStr) in $timeStr ($finalSpeedStr) -> $dest" -ForegroundColor Green
+        $safeDest = Sanitize-ForTerminal $dest
+        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $prefix Received $displayName ($finalSizeStr) in $timeStr ($finalSpeedStr) -> $safeDest" -ForegroundColor Green
         return $true
     } catch {
         if ($fileStream) { $fileStream.Dispose(); $fileStream = $null }
@@ -473,12 +489,15 @@ while ($true) {
 
         if ($res.changed) {
             if ($res.deleted) {
+                $safeDeleted = Sanitize-ForTerminal $res.deleted
                 if (-not ($res.deleted -like "*..*") -and -not [System.IO.Path]::IsPathRooted($res.deleted)) {
                     $targetFile = Join-Path $ResolvedTarget ($res.deleted -replace '/', [System.IO.Path]::DirectorySeparatorChar)
                     if (Test-Path $targetFile) {
                         Remove-Item $targetFile -Force -ErrorAction SilentlyContinue
-                        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] [DELETE] Removed $($res.deleted) (deleted on host)" -ForegroundColor Yellow
+                        Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] [DELETE] Removed $safeDeleted (deleted on host)" -ForegroundColor Yellow
                     }
+                } else {
+                    Write-Host "[ERROR] Path traversal blocked: $safeDeleted" -ForegroundColor Red
                 }
             } elseif ($res.file) {
                 [void](Sync-File -FileName $res.file.name -ExpectedHash $res.file.sha256 -Size $res.file.size)

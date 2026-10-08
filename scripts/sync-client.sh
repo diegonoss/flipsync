@@ -211,9 +211,25 @@ format_progress_line() {
 
     local stats
     if [[ -n "$tot" ]]; then
-        stats=" $(printf "%3d%%" "$pct") (${cur}/${tot}) ${spd} ETA ${eta}"
+        local full_stats=" $(printf "%3d%%" "$pct") (${cur}/${tot}) ${spd} ETA ${eta}"
+        local compact_stats=" $(printf "%3d%%" "$pct") ${cur} ${spd}"
+        local min_stats=" $(printf "%3d%%" "$pct") ${spd}"
+        if (( limit >= ${#prefix} + 1 + ${#full_stats} )); then
+            stats="$full_stats"
+        elif (( limit >= ${#prefix} + 1 + ${#compact_stats} )); then
+            stats="$compact_stats"
+        elif (( limit >= ${#prefix} + 1 + ${#min_stats} )); then
+            stats="$min_stats"
+        else
+            stats=" $(printf "%3d%%" "$pct")"
+        fi
     else
-        stats=" ${cur} (${spd})"
+        local full_stats=" ${cur} (${spd})"
+        if (( limit >= ${#prefix} + 1 + ${#full_stats} )); then
+            stats="$full_stats"
+        else
+            stats=" ${cur}"
+        fi
     fi
 
     local overhead=$(( ${#prefix} + 1 + ${#stats} ))
@@ -272,8 +288,11 @@ sync_file() {
     [[ ! "$file_idx" =~ ^[0-9]+$ ]] && file_idx=0
     [[ ! "$total_files" =~ ^[0-9]+$ ]] && total_files=0
 
+    local display_name
+    display_name="$(sanitize_for_terminal "$name")"
+
     if [[ "$name" == *".."* || "$name" == /* ]]; then
-        echo "[ERROR] Path traversal blocked for $name" >&2
+        echo "[ERROR] Path traversal blocked for $display_name" >&2
         return 1
     fi
     local dest="$TARGET/$name"
@@ -288,9 +307,6 @@ sync_file() {
     local enc_name tmp="$parent_dir/.$(basename "$name").tmp.$$.$RANDOM"
     enc_name="$(url_encode "$name")"
     local download_url="$SERVER/api/download/$enc_name$TOKEN_QUERY"
-
-    local display_name
-    display_name="$(sanitize_for_terminal "$name")"
 
     local is_tty=0
     [[ -t 1 ]] && is_tty=1
@@ -429,7 +445,9 @@ sync_file() {
         printf "\r%s\r" "$blank"
     fi
 
-    echo "[$(date +%T)] $prefix Received $display_name ($final_str) in $time_str ($final_spd_str) -> $dest"
+    local safe_dest
+    safe_dest="$(sanitize_for_terminal "$dest")"
+    echo "[$(date +%T)] $prefix Received $display_name ($final_str) in $time_str ($final_spd_str) -> $safe_dest"
 }
 
 # Fetches remote manifest and synchronizes all listed files.
@@ -539,19 +557,43 @@ run_main() {
         local curl_err
         curl_err="$(mktemp)"
         CURRENT_CURL_ERR="$curl_err"
-        curl -N -sS -f -H "Accept: text/event-stream" "$SERVER/api/events$TOKEN_QUERY" 2>"$CURRENT_CURL_ERR" | while read -r line; do
+        while read -r line; do
             if [[ "$line" =~ ^event:[[:space:]]*file_changed ]]; then
                 read -r data_line
                 if [[ "$data_line" =~ ^data:[[:space:]]*(.*) ]]; then
-                    node -e '
+                    parsed_info="$(node -e '
                         const d = JSON.parse(process.argv[1]);
                         if (d.file) console.log(`${d.file.name}\t${d.file.sha256}\t${d.file.size}`);
-                    ' "${BASH_REMATCH[1]}" | while IFS=$'\t' read -r fname fhash fsize; do
-                        sync_file "$fname" "$fhash" "${fsize:-0}" 1 1
-                    done
+                    ' "${BASH_REMATCH[1]}" 2>/dev/null || true)"
+                    if [[ -n "$parsed_info" ]]; then
+                        IFS=$'\t' read -r fname fhash fsize <<< "$parsed_info"
+                        if [[ -n "$fname" ]]; then
+                            sync_file "$fname" "$fhash" "${fsize:-0}" 1 1
+                        fi
+                    fi
+                fi
+            elif [[ "$line" =~ ^event:[[:space:]]*file_deleted ]]; then
+                read -r data_line
+                if [[ "$data_line" =~ ^data:[[:space:]]*(.*) ]]; then
+                    del_fname="$(node -e '
+                        const d = JSON.parse(process.argv[1]);
+                        if (d.filename) console.log(d.filename);
+                    ' "${BASH_REMATCH[1]}" 2>/dev/null || true)"
+                    if [[ -n "$del_fname" ]]; then
+                        safe_del="$(sanitize_for_terminal "$del_fname")"
+                        if [[ "$del_fname" == *".."* || "$del_fname" == /* ]]; then
+                            echo "[ERROR] Path traversal blocked for $safe_del" >&2
+                        else
+                            target_del="$TARGET/$del_fname"
+                            if [[ -f "$target_del" ]]; then
+                                rm -f "$target_del" 2>/dev/null || true
+                                echo "[$(date +%T)] [DELETE] Removed $safe_del (deleted on host)"
+                            fi
+                        fi
+                    fi
                 fi
             fi
-        done || true
+        done < <(curl -N -sS -f -H "Accept: text/event-stream" "$SERVER/api/events$TOKEN_QUERY" 2>"$CURRENT_CURL_ERR") || true
 
         err_output="$(cat "$CURRENT_CURL_ERR" 2>/dev/null || echo "")"
         rm -f "$CURRENT_CURL_ERR"

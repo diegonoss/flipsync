@@ -113,9 +113,24 @@ function formatProgressLine(prefix, fileName, percent, curStr, totStr, speedStr,
     const limit = Math.max(1, maxWidth - 1);
     const safeName = sanitizeForTerminal(fileName);
     const pctStr = String(percent).padStart(3);
-    const stats = totStr
-        ? ` ${pctStr}% (${curStr} / ${totStr}) ${speedStr} ETA ${etaStr}`
-        : ` ${curStr} (${speedStr})`;
+    let stats;
+    if (totStr) {
+        const fullStats = ` ${pctStr}% (${curStr} / ${totStr}) ${speedStr} ETA ${etaStr}`;
+        const compactStats = ` ${pctStr}% ${curStr} ${speedStr}`;
+        const minStats = ` ${pctStr}% ${speedStr}`;
+        if (limit >= prefix.length + 1 + fullStats.length) {
+            stats = fullStats;
+        } else if (limit >= prefix.length + 1 + compactStats.length) {
+            stats = compactStats;
+        } else if (limit >= prefix.length + 1 + minStats.length) {
+            stats = minStats;
+        } else {
+            stats = ` ${pctStr}%`;
+        }
+    } else {
+        const fullStats = ` ${curStr} (${speedStr})`;
+        stats = limit >= prefix.length + 1 + fullStats.length ? fullStats : ` ${curStr}`;
+    }
 
     const overhead = prefix.length + 1 + stats.length;
     const rem = limit - overhead;
@@ -186,6 +201,9 @@ class Client {
      * @returns {Promise<boolean>}
      */
     queueFile(file, idx = 0, total = 0) {
+        if (!this.running) {
+            return Promise.reject(new Error("Client stopped"));
+        }
         return new Promise((resolve, reject) => {
             this.downloadQueue.push({ file, idx, total, resolve, reject });
             this.processQueue();
@@ -204,7 +222,9 @@ class Client {
                 const res = await this.downloadIfChanged(item.file, item.idx, item.total);
                 item.resolve(res);
             } catch (err) {
-                console.error(`[CLIENT] [ERROR] Failed update: ${err.message}`);
+                if (this.running) {
+                    console.error(`[CLIENT] [ERROR] Failed update: ${err.message}`);
+                }
                 item.reject(err);
             }
         }
@@ -237,7 +257,11 @@ class Client {
      */
     stop() {
         this.running = false;
+        const pending = this.downloadQueue;
         this.downloadQueue = [];
+        for (const item of pending) {
+            item.reject(new Error("Client stopped"));
+        }
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         if (this.activeReq) this.activeReq.destroy();
     }
@@ -288,7 +312,7 @@ class Client {
         const dest = path.resolve(this.target, file.name);
         const rel = path.relative(this.target, dest);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
-            console.error(`[ERROR] Path traversal blocked: ${file.name}`);
+            console.error(`[ERROR] Path traversal blocked: ${sanitizeForTerminal(file.name)}`);
             return false;
         }
         const parentDir = path.dirname(dest);
@@ -308,7 +332,7 @@ class Client {
 
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
-            throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${hash}`);
+            throw new Error(`Hash mismatch for ${sanitizeForTerminal(file.name)}: expected ${file.sha256}, got ${hash}`);
         }
 
         // Atomic write
@@ -323,7 +347,7 @@ class Client {
         const finalSpeedStr = formatSpeed(buf.length / durSec);
         const timeStr = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
         const displayName = sanitizeForTerminal(file.name);
-        console.log(`[CLIENT] ${prefix} Received ${displayName} (${finalSizeStr}) in ${timeStr} (${finalSpeedStr}) -> ${dest}`);
+        console.log(`[CLIENT] ${prefix} Received ${displayName} (${finalSizeStr}) in ${timeStr} (${finalSpeedStr}) -> ${sanitizeForTerminal(dest)}`);
         return true;
     }
 
@@ -436,6 +460,8 @@ class Client {
                 if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
                     try { fs.unlinkSync(dest); } catch {}
                     console.log(`[CLIENT] Host deleted: ${sanitizeForTerminal(parsed.filename)}`);
+                } else {
+                    console.error(`[ERROR] Path traversal blocked: ${sanitizeForTerminal(parsed.filename)}`);
                 }
             }
         } catch {}
