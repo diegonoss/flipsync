@@ -191,6 +191,7 @@ class Client {
         this.activeDownloadReqs = new Set();
         this.running = false;
         this.generation = 0;
+        this.fileVersions = new Map();
         this.downloadQueue = [];
         this.isProcessingQueue = false;
         this.reconnectDelay = opts.reconnectDelay || 1000;
@@ -225,8 +226,10 @@ class Client {
         if (!this.running) {
             return Promise.reject(new Error("Client stopped"));
         }
+        const version = (this.fileVersions.get(file.name) || 0) + 1;
+        this.fileVersions.set(file.name, version);
         return new Promise((resolve, reject) => {
-            this.downloadQueue.push({ file, idx, total, resolve, reject });
+            this.downloadQueue.push({ file, idx, total, version, resolve, reject });
             this.processQueue();
         });
     }
@@ -240,7 +243,10 @@ class Client {
         while (this.downloadQueue.length > 0 && this.running) {
             const item = this.downloadQueue.shift();
             try {
-                const res = await this.downloadIfChanged(item.file, item.idx, item.total);
+                if (this.fileVersions.get(item.file.name) !== item.version) {
+                    throw new Error(`Superseded download for ${sanitizeForTerminal(item.file.name)}`);
+                }
+                const res = await this.downloadIfChanged(item.file, item.idx, item.total, item.version);
                 item.resolve(res);
             } catch (err) {
                 if (this.running) {
@@ -280,6 +286,7 @@ class Client {
     stop() {
         this.running = false;
         this.generation++;
+        this.fileVersions.clear();
         const pending = this.downloadQueue;
         this.downloadQueue = [];
         for (const item of pending) {
@@ -326,7 +333,9 @@ class Client {
             for (const f of files) {
                 if (!this.running || this.generation !== opGen) throw new Error("Client stopped");
                 idx++;
-                if (await this.downloadIfChanged(f, idx, files.length)) updated++;
+                const v = (this.fileVersions.get(f.name) || 0) + 1;
+                this.fileVersions.set(f.name, v);
+                if (await this.downloadIfChanged(f, idx, files.length, v)) updated++;
             }
             if (!this.running || this.generation !== opGen) throw new Error("Client stopped");
             console.log(`[CLIENT] Remote check: ${files.length} file(s) verified, ${updated} updated.`);
@@ -346,13 +355,22 @@ class Client {
      * @param {number} [file.size] - File size in bytes.
      * @param {number} [idx=0] - 1-based index in batch.
      * @param {number} [totalFiles=0] - Total count of files in batch.
+     * @param {number} [version=null] - Monotonic file version.
      * @returns {Promise<boolean>} True if file was downloaded and written.
      */
-    async downloadIfChanged(file, idx = 0, totalFiles = 0) {
+    async downloadIfChanged(file, idx = 0, totalFiles = 0, version = null) {
         const opGen = this.generation;
         if (!this.running) {
             throw new Error("Client stopped");
         }
+        const opVersion = version !== null ? version : ((this.fileVersions.get(file.name) || 0) + 1);
+        if (version === null) {
+            this.fileVersions.set(file.name, opVersion);
+        }
+        if (this.fileVersions.get(file.name) !== opVersion) {
+            throw new Error(`Superseded download for ${sanitizeForTerminal(file.name)}`);
+        }
+
         const dest = path.resolve(this.target, file.name);
         const rel = path.relative(this.target, dest);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -377,6 +395,9 @@ class Client {
         if (!this.running || this.generation !== opGen) {
             throw new Error("Client stopped");
         }
+        if (this.fileVersions.get(file.name) !== opVersion) {
+            throw new Error(`Superseded download for ${sanitizeForTerminal(file.name)}`);
+        }
 
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
@@ -386,15 +407,21 @@ class Client {
         if (!this.running || this.generation !== opGen) {
             throw new Error("Client stopped");
         }
+        if (this.fileVersions.get(file.name) !== opVersion) {
+            throw new Error(`Superseded download for ${sanitizeForTerminal(file.name)}`);
+        }
 
         // Atomic write
         fs.mkdirSync(parentDir, { recursive: true });
         const tmp = path.join(parentDir, `.${path.basename(file.name)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`);
         fs.writeFileSync(tmp, buf);
 
-        if (!this.running || this.generation !== opGen) {
+        if (!this.running || this.generation !== opGen || this.fileVersions.get(file.name) !== opVersion) {
             try { fs.unlinkSync(tmp); } catch {}
-            throw new Error("Client stopped");
+            if (!this.running || this.generation !== opGen) {
+                throw new Error("Client stopped");
+            }
+            throw new Error(`Superseded download for ${sanitizeForTerminal(file.name)}`);
         }
 
         fs.renameSync(tmp, dest);
@@ -525,6 +552,7 @@ class Client {
                 const dest = path.resolve(this.target, parsed.filename);
                 const rel = path.relative(this.target, dest);
                 if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+                    this.fileVersions.set(parsed.filename, (this.fileVersions.get(parsed.filename) || 0) + 1);
                     try { fs.unlinkSync(dest); } catch {}
                     console.log(`[CLIENT] Host deleted: ${sanitizeForTerminal(parsed.filename)}`);
                 } else {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -513,6 +514,118 @@ export async function testStandaloneClients(): Promise<void> {
         } finally {
             await new Promise<void>((r) => errServer.close(() => r()));
             fs.rmSync(errTargetDir, { recursive: true, force: true });
+        }
+
+        // 5d. Verify stale same-file downloads during reconnect are superseded and do not overwrite newer content
+        let sse5dRes: http.ServerResponse | null = null;
+        let releaseH1: (() => void) | null = null;
+        const test5dSockets = new Set<any>();
+
+        const contentH1 = "content-v1-stale";
+        const hashH1 = crypto.createHash("sha256").update(contentH1).digest("hex");
+        const contentH2 = "content-v2-fresh";
+        const hashH2 = crypto.createHash("sha256").update(contentH2).digest("hex");
+
+        let h1Started = false;
+        let h2Finished = false;
+
+        const staleRaceServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                sse5dRes = res;
+                res.writeHead(200, {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    Connection: "keep-alive"
+                });
+                res.write(`event: file_changed\ndata: {"file":{"name":"race.txt","sha256":"${hashH1}","size":${contentH1.length}}}\n\n`);
+            } else if (req.url?.includes("/api/download/race.txt")) {
+                if (!h1Started) {
+                    h1Started = true;
+                    res.writeHead(200, {
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": String(contentH1.length)
+                    });
+                    if (sse5dRes) {
+                        sse5dRes.end();
+                    }
+                    releaseH1 = () => {
+                        res.end(contentH1);
+                    };
+                } else {
+                    res.writeHead(200, {
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": String(contentH2.length)
+                    });
+                    res.end(contentH2);
+                    h2Finished = true;
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "race.txt": { name: "race.txt", sha256: hashH2, size: contentH2.length }
+                    }
+                }));
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        staleRaceServer.on("connection", (socket) => {
+            test5dSockets.add(socket);
+            socket.on("close", () => test5dSockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => staleRaceServer.listen(0, "127.0.0.1", () => resolve()));
+        const staleRacePort = (staleRaceServer.address() as any).port;
+        const staleRaceUrl = `http://127.0.0.1:${staleRacePort}`;
+
+        const staleRaceTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-stale-race-"));
+        try {
+            const staleClient = new Client({
+                server: staleRaceUrl,
+                target: staleRaceTargetDir,
+                once: false,
+                reconnectDelay: 20
+            });
+            staleClient.running = true;
+            staleClient.connectSse(20);
+
+            // Wait until H2 completes from reconnect manifest
+            for (let i = 0; i < 50; i++) {
+                if (h2Finished) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.equal(h2Finished, true, "Expected H2 download to complete before H1 release");
+
+            // Destination must currently have H2
+            const destPath = path.join(staleRaceTargetDir, "race.txt");
+            assert.equal(fs.existsSync(destPath), true);
+            assert.equal(fs.readFileSync(destPath, "utf8"), contentH2);
+
+            // Now release stalled H1
+            assert.ok(releaseH1, "Expected releaseH1 callback to be set");
+            const op1Promise = staleClient.lastFilePromise;
+            (releaseH1 as () => void)();
+
+            // Wait for op1 to settle (reject with Superseded download)
+            if (op1Promise) {
+                await assert.rejects(op1Promise, /Superseded download/);
+            }
+
+            // Small delay to ensure any asynchronous operations completed
+            await new Promise((r) => setTimeout(r, 50));
+
+            // Assert destination STILL contains H2 and was not overwritten by H1
+            assert.equal(fs.readFileSync(destPath, "utf8"), contentH2);
+
+            // Assert no temporary files remain
+            const remaining = fs.readdirSync(staleRaceTargetDir).filter((f) => f.includes(".tmp."));
+            assert.equal(remaining.length, 0, "Expected no temporary files to remain");
+
+            staleClient.stop();
+        } finally {
+            for (const sock of test5dSockets) sock.destroy();
+            await new Promise<void>((r) => staleRaceServer.close(() => r()));
+            fs.rmSync(staleRaceTargetDir, { recursive: true, force: true });
         }
 
         // 6. Verify terminal sanitization on path-traversal errors and destination logs
