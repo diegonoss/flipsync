@@ -188,6 +188,7 @@ class Client {
         this.once = !!opts.once;
         this.reconnectTimer = null;
         this.activeReq = null;
+        this.activeDownloadReq = null;
         this.running = false;
         this.downloadQueue = [];
         this.isProcessingQueue = false;
@@ -262,8 +263,18 @@ class Client {
         for (const item of pending) {
             item.reject(new Error("Client stopped"));
         }
-        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-        if (this.activeReq) this.activeReq.destroy();
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.activeReq) {
+            this.activeReq.destroy(new Error("Client stopped"));
+            this.activeReq = null;
+        }
+        if (this.activeDownloadReq) {
+            this.activeDownloadReq.destroy(new Error("Client stopped"));
+            this.activeDownloadReq = null;
+        }
     }
 
     /**
@@ -474,22 +485,37 @@ class Client {
      * @returns {Promise<{status: number, body: string}|Buffer>} Response payload.
      */
     httpReq(urlStr, asBuffer = false) {
+        if (!this.running && this.running !== undefined) {
+            return Promise.reject(new Error("Client stopped"));
+        }
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);
-            (parsed.protocol === "https:" ? https : http)
+            const req = (parsed.protocol === "https:" ? https : http)
                 .get(parsed, (res) => {
                     if (res.statusCode === 401 || res.statusCode === 403) {
                         fatal(`Authentication failed (HTTP ${res.statusCode}). A valid bearer token is required.`);
                     }
-                    if (asBuffer && res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+                    if (asBuffer && res.statusCode !== 200) {
+                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                        return reject(new Error(`HTTP ${res.statusCode}`));
+                    }
                     const chunks = [];
                     res.on("data", (c) => chunks.push(c));
                     res.on("end", () => {
+                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
                         const buf = Buffer.concat(chunks);
                         resolve(asBuffer ? buf : { status: res.statusCode || 0, body: buf.toString("utf8") });
                     });
+                    res.on("error", (err) => {
+                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                        reject(err);
+                    });
                 })
-                .on("error", reject);
+                .on("error", (err) => {
+                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    reject(err);
+                });
+            this.activeDownloadReq = req;
         });
     }
 
@@ -509,6 +535,9 @@ class Client {
      * @returns {Promise<Buffer>} Complete file content Buffer.
      */
     httpDownload(urlStr, fileName = "file", totalSize = 0, prefix = "[SYNC]") {
+        if (!this.running) {
+            return Promise.reject(new Error("Client stopped"));
+        }
         return new Promise((resolve, reject) => {
             const parsed = new URL(urlStr);
             const transport = parsed.protocol === "https:" ? https : http;
@@ -518,6 +547,7 @@ class Client {
                     fatal(`Authentication failed downloading ${displayName} (HTTP ${res.statusCode}). A valid bearer token is required.`);
                 }
                 if (res.statusCode !== 200) {
+                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
                     return reject(new Error(`HTTP ${res.statusCode}`));
                 }
 
@@ -562,14 +592,23 @@ class Client {
                 });
 
                 res.on("end", () => {
+                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
                     if (isTTY) {
                         process.stdout.write(`\r${" ".repeat(limit)}\r`);
                     }
                     resolve(Buffer.concat(chunks));
                 });
-                res.on("error", reject);
+                res.on("error", (err) => {
+                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    reject(err);
+                });
             });
-            req.on("error", reject);
+
+            this.activeDownloadReq = req;
+            req.on("error", (err) => {
+                if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                reject(err);
+            });
         });
     }
 }

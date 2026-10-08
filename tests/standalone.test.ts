@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { exec, spawn, spawnSync } from "node:child_process";
@@ -332,6 +333,56 @@ export async function testStandaloneClients(): Promise<void> {
             assert.equal(await p1, true);
         } finally {
             fs.rmSync(mockStopDir, { recursive: true, force: true });
+        }
+
+        // 5b. Verify Client.stop() cancels an in-flight download request promptly
+        const stallServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/download/")) {
+                res.writeHead(200, {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": "10000"
+                });
+                res.write("partial-chunk");
+                // Stall indefinitely without calling res.end()
+            } else {
+                res.writeHead(404).end();
+            }
+        });
+        await new Promise<void>((resolve) => stallServer.listen(0, "127.0.0.1", () => resolve()));
+        const stallPort = (stallServer.address() as any).port;
+        const stallUrl = `http://127.0.0.1:${stallPort}`;
+
+        const stallTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-stall-"));
+        try {
+            const stallClient = new Client({
+                server: stallUrl,
+                target: stallTargetDir,
+                once: false
+            });
+            stallClient.running = true;
+
+            const inflightPromise = stallClient.queueFile({ name: "stalled.bin", sha256: "fake", size: 10000 });
+
+            for (let i = 0; i < 20; i++) {
+                if (stallClient.activeDownloadReq) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.ok(stallClient.activeDownloadReq, "Expected activeDownloadReq to be assigned for in-flight download");
+
+            stallClient.stop();
+            assert.equal(stallClient.running, false);
+            assert.equal(stallClient.activeDownloadReq, null);
+
+            await assert.rejects(
+                Promise.race([
+                    inflightPromise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout waiting for in-flight rejection")), 1000))
+                ]),
+                /Client stopped/
+            );
+        } finally {
+            await new Promise<void>((r) => stallServer.close(() => r()));
+            fs.rmSync(stallTargetDir, { recursive: true, force: true });
         }
 
         // 6. Verify terminal sanitization on path-traversal errors and destination logs
