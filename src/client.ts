@@ -10,6 +10,7 @@ export class SyncClient {
     private isRunning = false;
     private reconnectTimeout: NodeJS.Timeout | null = null;
     private abortController: AbortController | null = null;
+    private downloadAbortController: AbortController | null = null;
 
     constructor(private readonly options: ClientOptions) {
         let url = options.serverUrl.trim();
@@ -23,6 +24,7 @@ export class SyncClient {
 
     public async start(): Promise<void> {
         this.isRunning = true;
+        this.downloadAbortController = new AbortController();
         fs.mkdirSync(this.targetDir, { recursive: true });
 
         if (this.verbose) {
@@ -44,20 +46,27 @@ export class SyncClient {
         this.isRunning = false;
         if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
         this.abortController?.abort();
-        this.reconnectTimeout = this.abortController = null;
+        this.downloadAbortController?.abort();
+        this.reconnectTimeout = this.abortController = this.downloadAbortController = null;
     }
 
     private fail(message: string): Error {
         const error = new Error(message);
+        if (!this.isRunning) return error;
+        this.stop();
         if (this.verbose) console.error(`[CLIENT] [FATAL] ${message}`);
         this.options.onError?.(error);
-        this.stop();
         return error;
     }
 
     public async syncManifest(): Promise<void> {
         try {
-            const res = await fetch(this.url("/api/manifest"));
+            if (!this.downloadAbortController || this.downloadAbortController.signal.aborted) {
+                this.downloadAbortController = new AbortController();
+            }
+            const res = await fetch(this.url("/api/manifest"), {
+                signal: this.downloadAbortController.signal
+            });
             if (res.status === 401 || res.status === 403) {
                 throw this.fail(`Authentication failed: HTTP ${res.status} (valid bearer token required)`);
             }
@@ -87,7 +96,20 @@ export class SyncClient {
         }
     }
 
+    private writeDownloadedFile(destPath: string, destDir: string, buffer: Buffer): boolean {
+        fs.mkdirSync(destDir, { recursive: true });
+        const tempPath = path.join(destDir, `.${path.basename(destPath)}.tmp.${Date.now()}`);
+        fs.writeFileSync(tempPath, buffer);
+        if (!this.isRunning) {
+            try { fs.unlinkSync(tempPath); } catch {}
+            return false;
+        }
+        fs.renameSync(tempPath, destPath);
+        return true;
+    }
+
     public async downloadIfChanged(file: SyncFileMeta): Promise<boolean> {
+        if (!this.isRunning) return false;
         const destPath = path.resolve(this.targetDir, file.name);
         const rel = path.relative(this.targetDir, destPath);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -97,33 +119,41 @@ export class SyncClient {
         fs.mkdirSync(destDir, { recursive: true });
 
         if (await verifyFileHash(destPath, file.sha256)) return false;
+        if (!this.isRunning) return false;
 
         const startMs = Date.now();
         const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
-        const res = await fetch(this.url(`/api/download/${encodedName}`));
-        if (res.status === 401 || res.status === 403) {
-            throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
+        try {
+            const res = await fetch(this.url(`/api/download/${encodedName}`), {
+                signal: this.downloadAbortController?.signal
+            });
+            if (res.status === 401 || res.status === 403) {
+                throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
+            }
+            if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
+
+            const buffer = Buffer.from(await res.arrayBuffer());
+            if (!this.isRunning) return false;
+            const downloadedHash = computeBufferHash(buffer);
+            if (downloadedHash !== file.sha256) {
+                throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
+            }
+
+            if (!this.writeDownloadedFile(destPath, destDir, buffer)) return false;
+
+            if (this.verbose) {
+                const kb = (file.size / 1024).toFixed(1);
+                console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${Date.now() - startMs}ms -> ${destPath}`);
+            }
+
+            this.options.onSync?.(file);
+            return true;
+        } catch (err: unknown) {
+            if (!this.isRunning && err instanceof Error && err.name === "AbortError") {
+                return false;
+            }
+            throw err;
         }
-        if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
-
-        const buffer = Buffer.from(await res.arrayBuffer());
-        const downloadedHash = computeBufferHash(buffer);
-        if (downloadedHash !== file.sha256) {
-            throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
-        }
-
-        fs.mkdirSync(destDir, { recursive: true });
-        const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
-        fs.writeFileSync(tempPath, buffer);
-        fs.renameSync(tempPath, destPath);
-
-        if (this.verbose) {
-            const kb = (file.size / 1024).toFixed(1);
-            console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${Date.now() - startMs}ms -> ${destPath}`);
-        }
-
-        this.options.onSync?.(file);
-        return true;
     }
 
     private async readSseStream(res: Response): Promise<void> {

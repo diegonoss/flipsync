@@ -288,20 +288,25 @@ export class SyncEngine extends EventEmitter {
         this.isRunning = true;
         this.status = "syncing";
 
-        if (!fs.existsSync(this.syncDir)) {
-            try {
-                fs.mkdirSync(this.syncDir, { recursive: true });
-            } catch (err: unknown) {
-                const error = err instanceof Error ? err : new Error(String(err));
-                this.emit("sync:error", { error, context: "fs:mkdir" });
-                throw error;
+        try {
+            if (!fs.existsSync(this.syncDir)) {
+                try {
+                    fs.mkdirSync(this.syncDir, { recursive: true });
+                } catch (err: unknown) {
+                    const error = err instanceof Error ? err : new Error(String(err));
+                    this.emit("sync:error", { error, context: "fs:mkdir" });
+                    throw error;
+                }
             }
-        }
 
-        if (this.role === "host") {
-            await this.startHost();
-        } else {
-            await this.startClient();
+            if (this.role === "host") {
+                await this.startHost();
+            } else {
+                await this.startClient();
+            }
+        } catch (err: unknown) {
+            await this.stop();
+            throw err;
         }
     }
 
@@ -957,6 +962,7 @@ export class SyncEngine extends EventEmitter {
 
     public async syncManifest(): Promise<void> {
         if (!this.serverUrl) return;
+        const priorStatus = this.status;
         this.status = "syncing";
 
         try {
@@ -988,6 +994,10 @@ export class SyncEngine extends EventEmitter {
         } catch (err: unknown) {
             const error = err instanceof Error ? err : new Error(String(err));
             if (error.message.includes("Authentication failed")) throw error;
+            const currentStatus = this.status as SyncEngineStatus;
+            if (this.isRunning && currentStatus !== "stopped" && currentStatus !== "error") {
+                this.status = priorStatus === "paused" ? "paused" : "idle";
+            }
             this.stats.errorsCount++;
             this.emit("sync:error", { error, context: "syncManifest" });
             if (this.syncOnce) throw error;

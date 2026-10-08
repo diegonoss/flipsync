@@ -18,6 +18,7 @@ export interface TuiOptions {
 
 export interface TuiController {
     stop: () => Promise<void>;
+    destroy: () => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -277,9 +278,23 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     engine.on("sync:cancelled", () => addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow"));
 
     // Keybindings & Shutdown
-    const restoreTerminalAndExit = (code: number): void => {
+    let renderInterval: NodeJS.Timeout | null = null;
+
+    const onSigInt = () => void cleanExit(0);
+    const onSigTerm = () => void cleanExit(0);
+
+    const destroyTui = (): void => {
+        if (renderTimer) clearTimeout(renderTimer);
+        if (renderInterval) clearInterval(renderInterval);
+        process.removeListener("SIGINT", onSigInt);
+        process.removeListener("SIGTERM", onSigTerm);
+        try { activeCommandModal?.close(); } catch {}
         try { screen.destroy(); } catch {}
         process.stdout.write("\x1b[?1049l\x1b[?25h");
+    };
+
+    const restoreTerminalAndExit = (code: number): void => {
+        destroyTui();
         process.exit(code);
     };
 
@@ -289,10 +304,6 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
 
         const forceExitTimer = setTimeout(() => restoreTerminalAndExit(code), 1500);
         forceExitTimer.unref();
-
-        if (renderTimer) clearTimeout(renderTimer);
-        clearInterval(renderInterval);
-        try { activeCommandModal?.close(); } catch {}
 
         try {
             await engine.stop();
@@ -319,7 +330,7 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         if (isModalOpen()) return Promise.resolve();
         isPickerOpen = true;
 
-        return new Promise<void>((resolve) => {
+        return new Promise<void>((resolve, reject) => {
             openFolderPicker(
                 screen,
                 {
@@ -333,10 +344,14 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
                         await engine.start();
                         addLog("FOLDER", `Sync directory set to: {underline}${chosenDir}{/}`, "cyan");
                         updateAll();
-                    } catch (err) {
-                        addLog("ERROR", `Failed to set folder: ${err instanceof Error ? err.message : String(err)}`, "red");
-                    } finally {
                         resolve();
+                    } catch (err) {
+                        if (isInitial) {
+                            reject(err);
+                        } else {
+                            addLog("ERROR", `Failed to set folder: ${err instanceof Error ? err.message : String(err)}`, "red");
+                            resolve();
+                        }
                     }
                 },
                 () => {
@@ -399,25 +414,31 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     screen.key(["pagedown"], () => scrollLog(5));
 
     // Handle OS signals
-    process.on("SIGINT", () => cleanExit(0));
-    process.on("SIGTERM", () => cleanExit(0));
+    process.on("SIGINT", onSigInt);
+    process.on("SIGTERM", onSigTerm);
 
     // Periodic UI refresh for speed calculations and clock
-    const renderInterval = setInterval(() => {
+    renderInterval = setInterval(() => {
         if (!isExiting && !isModalOpen()) updateAll();
     }, 500);
 
     // Initial render
     updateAll();
 
-    // If folder wasn't specified on CLI, prompt user to select folder immediately upon entering TUI
-    if (options.promptFolderOnStart) {
-        await showFolderSelector(true);
-    } else {
-        await engine.start();
+    try {
+        // If folder wasn't specified on CLI, prompt user to select folder immediately upon entering TUI
+        if (options.promptFolderOnStart) {
+            await showFolderSelector(true);
+        } else {
+            await engine.start();
+        }
+    } catch (err) {
+        destroyTui();
+        throw err;
     }
 
     return {
-        stop: () => cleanExit(0)
+        stop: () => cleanExit(0),
+        destroy: destroyTui
     };
 }

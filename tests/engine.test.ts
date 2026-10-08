@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SyncEngine } from "../src/core/SyncEngine.js";
-import { runHeadlessCli } from "../src/cli/index.js";
+import { runHeadlessCli, startSyncCli } from "../src/cli/index.js";
+import { SyncClient } from "../src/client.js";
 import type {
     SyncEngineReadyEvent,
     SyncStartEvent,
@@ -233,11 +234,50 @@ export async function testSyncEngine(): Promise<void> {
         assert.equal(hostEngine.getState().status, "idle");
         assert.equal(hostEngine.getState().activeTransfers.length, 0);
 
+        // Test status restoration on failed manifest request
+        const reconnectEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir, token });
+        await reconnectEngine.start();
+        assert.equal(reconnectEngine.getState().status, "idle");
+
+        const origHttpRequest = (reconnectEngine as any).httpRequest;
+        (reconnectEngine as any).httpRequest = async () => { throw new Error("Network glitch"); };
+        await reconnectEngine.syncManifest();
+        assert.equal(reconnectEngine.getState().status, "idle", "Should restore status to idle after failed manifest sync");
+
+        (reconnectEngine as any).httpRequest = origHttpRequest;
+        await reconnectEngine.syncManifest();
+        assert.equal(reconnectEngine.getState().status, "idle", "Should return to idle after successful sync");
+        await reconnectEngine.stop();
+
         // Test that client without token rejects on start
         const unauthEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir });
         await assert.rejects(() => unauthEngine.start(), { message: /Authentication failed/ });
         assert.equal(unauthEngine.getState().status, "stopped");
         assert.equal((unauthEngine as any).isRunning, false);
+
+        // Test that sibling downloads cancel after auth failure with exactly one fatal error
+        let clientErrorCount = 0;
+        const testClient = new SyncClient({
+            serverUrl: hostUrl,
+            targetDir: clientDir,
+            token: "invalid-token",
+            verbose: false,
+            onError: () => { clientErrorCount++; }
+        });
+        await assert.rejects(() => testClient.start(), { message: /Authentication failed/ });
+        assert.equal(clientErrorCount, 1, "Should emit exactly one fatal onError callback on auth failure");
+        assert.equal((testClient as any).isRunning, false);
+
+        // Test engine startup failure resets state and startSyncCli handles failure
+        const failingEngine = new SyncEngine({ role: "client", serverUrl: "http://127.0.0.1:1", syncDir: clientDir, once: true });
+        await assert.rejects(() => failingEngine.start());
+        assert.equal(failingEngine.getState().status, "stopped");
+        assert.equal((failingEngine as any).isRunning, false);
+
+        const cliFailingEngine = new SyncEngine({ role: "client", serverUrl: "http://127.0.0.1:1", syncDir: clientDir, once: true });
+        await assert.rejects(() => startSyncCli(cliFailingEngine, { execMode: "tui", hasExplicitDir: true }));
+        assert.equal(cliFailingEngine.getState().status, "stopped");
+        assert.equal((cliFailingEngine as any).isRunning, false);
     } finally {
         await hostEngine.stop();
         fs.rmSync(hostDir, { recursive: true, force: true });
