@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { SyncEngine } from "../src/core/SyncEngine.js";
-import { runHeadlessCli } from "../src/cli/index.js";
-import { runTui } from "../src/tui/index.js";
+import { startSyncCli } from "../src/cli/index.js";
 
 interface HostCliOptions {
     dir?: string;
@@ -72,29 +71,18 @@ async function main(): Promise<void> {
 
     const hasExplicitDir = Boolean(options.dir || process.env.SYNC_DIR);
 
-    if (execMode === "tui") {
-        try {
-            await runTui(engine, { promptFolderOnStart: !hasExplicitDir });
-        } catch (err: unknown) {
-            const error = err instanceof Error ? err : new Error(String(err));
-            process.stderr.write(`[WARN] TUI initialization failed: ${error.message}. Falling back to headless mode.\n`);
-            await runHeadlessCli(engine, {
-                format: options.format,
-                quiet: options.quiet
-            });
-            await engine.start();
-        }
-    } else {
-        await runHeadlessCli(engine, {
-            format: options.format,
-            quiet: options.quiet
-        });
-        await engine.start();
-    }
+    await startSyncCli(engine, {
+        execMode,
+        hasExplicitDir,
+        format: options.format,
+        quiet: options.quiet
+    });
 }
 
-main().catch((err: unknown) => {
+try {
+    await main();
+} catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err));
     process.stderr.write(`[HOST] Fatal error: ${error.message}\n`);
     process.exit(1);
-});
+}

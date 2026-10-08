@@ -19,11 +19,11 @@ export function detectTailscaleIp(): string | null {
     try {
         const isWin = process.platform === "win32";
         const candidates = isWin
-            ? ["C:\\Program Files\\Tailscale\\tailscale.exe", "tailscale.exe"]
+            ? [String.raw`C:\Program Files\Tailscale\tailscale.exe`, "tailscale.exe"]
             : ["/usr/bin/tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "tailscale"];
         const tailscaleBin = candidates.find((p) => p.includes(path.sep) ? fs.existsSync(p) : false) ?? "tailscale";
         const safePath = isWin
-            ? "C:\\Windows\\System32;C:\\Program Files\\Tailscale"
+            ? String.raw`C:\Windows\System32;C:\Program Files\Tailscale`
             : "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
         const out = execSync(`"${tailscaleBin}" ip -4`, {
             encoding: "utf8",
@@ -55,6 +55,20 @@ export function findCloudflaredBinary(): string | null {
         path.resolve(".bin/cloudflared.exe")
     ];
     return candidates.find((p) => fs.existsSync(p)) ?? null;
+}
+
+async function waitForTunnelPropagation(publicUrl: string, maxDurationMs = 15000): Promise<void> {
+    const probeStart = Date.now();
+    const probeNext = async (): Promise<void> => {
+        if (Date.now() - probeStart >= maxDurationMs) return;
+        const probe = await fetch(`${publicUrl}/api/status`, {
+            signal: AbortSignal.timeout(2000)
+        }).catch(() => null);
+        if (probe && (probe.status === 200 || probe.status === 401)) return;
+        await new Promise((r) => setTimeout(r, 1000));
+        return probeNext();
+    };
+    await probeNext();
 }
 
 export async function startCloudflareTunnel(localPort: number, binaryPath?: string): Promise<TunnelResult> {
@@ -90,22 +104,13 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
 
         const onOutput = async (data: Buffer): Promise<void> => {
             captureLog(data);
-            const match = data.toString().match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+            const match = /https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/.exec(data.toString());
             if (match && !settled) {
                 settled = true;
                 clearTimeout(timeout);
                 const publicUrl = match[0];
 
-                // Pre-warm / wait for DNS and edge propagation (up to 15s)
-                const probeStart = Date.now();
-                while (Date.now() - probeStart < 15000) {
-                    const probe = await fetch(`${publicUrl}/api/status`, {
-                        signal: AbortSignal.timeout(2000)
-                    }).catch(() => null);
-                    // 200 (unauthenticated status) or 401 (authenticated server active) verifies reachability
-                    if (probe && (probe.status === 200 || probe.status === 401)) break;
-                    await new Promise((r) => setTimeout(r, 1000));
-                }
+                await waitForTunnelPropagation(publicUrl);
 
                 resolve({
                     url: publicUrl,
@@ -136,7 +141,12 @@ export async function startCloudflareTunnel(localPort: number, binaryPath?: stri
 
 export function getCloudflaredDownloadUrl(): string {
     const osName = process.platform === "win32" ? "windows" : process.platform;
-    const archName = process.arch === "arm64" || process.arch === "arm" ? process.arch : process.arch === "ia32" ? "386" : "amd64";
+    let archName = "amd64";
+    if (process.arch === "arm64" || process.arch === "arm") {
+        archName = process.arch;
+    } else if (process.arch === "ia32") {
+        archName = "386";
+    }
     const ext = process.platform === "win32" ? ".exe" : "";
     return `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${osName}-${archName}${ext}`;
 }

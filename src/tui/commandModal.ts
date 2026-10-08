@@ -33,13 +33,11 @@ export async function copyToClipboard(text: string): Promise<boolean> {
             cmd = "clip.exe";
         } else if (platform === "darwin") {
             cmd = "pbcopy";
+        } else if (process.env.WAYLAND_DISPLAY) {
+            cmd = "wl-copy";
         } else {
-            if (process.env.WAYLAND_DISPLAY) {
-                cmd = "wl-copy";
-            } else {
-                cmd = "xclip";
-                args = ["-selection", "clipboard"];
-            }
+            cmd = "xclip";
+            args = ["-selection", "clipboard"];
         }
 
         let resolved = false;
@@ -132,7 +130,10 @@ export function extractEndpoints(state: SyncEngineState): EndpointOption[] {
  * Generates ready-to-run zero-install commands for Windows PowerShell, Linux/macOS Bash, and Node.js.
  */
 export function generateClientCommands(serverUrl: string, token?: string): ClientCommands {
-    const cleanUrl = serverUrl.trim().replace(/\/+$/, "");
+    let cleanUrl = serverUrl.trim();
+    while (cleanUrl.endsWith("/")) {
+        cleanUrl = cleanUrl.slice(0, -1);
+    }
     const tokenPartBash = token ? ` --token "${token}"` : "";
 
     const powershell = token

@@ -110,7 +110,7 @@ export function openFolderPicker(
         tags: true
     });
 
-    const hintBox = blessed.box({
+    blessed.box({
         parent: modalBox,
         bottom: 0,
         left: 1,
@@ -181,7 +181,7 @@ export function openFolderPicker(
             label: " Enter Custom Directory Path "
         });
 
-        const label = blessed.box({
+        blessed.box({
             parent: inputModal,
             top: 0,
             left: 1,

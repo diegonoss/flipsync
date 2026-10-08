@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { SyncEngine } from "../src/core/SyncEngine.js";
-import { runHeadlessCli } from "../src/cli/index.js";
-import { runTui } from "../src/tui/index.js";
+import { startSyncCli } from "../src/cli/index.js";
 
 interface CliOptions {
     dir?: string;
@@ -65,26 +64,12 @@ async function startEngine(role: "host" | "client", options: CliOptions): Promis
         (role === "client" && process.env.SYNC_TARGET)
     );
 
-    if (execMode === "tui") {
-        try {
-            await runTui(engine, { promptFolderOnStart: !hasExplicitDir });
-        } catch (err: unknown) {
-            // If TUI initialization fails (e.g. invalid terminal), fallback to headless
-            const error = err instanceof Error ? err : new Error(String(err));
-            process.stderr.write(`[WARN] TUI initialization failed: ${error.message}. Falling back to headless mode.\n`);
-            await runHeadlessCli(engine, {
-                format: options.format,
-                quiet: options.quiet
-            });
-            await engine.start();
-        }
-    } else {
-        await runHeadlessCli(engine, {
-            format: options.format,
-            quiet: options.quiet
-        });
-        await engine.start();
-    }
+    await startSyncCli(engine, {
+        execMode,
+        hasExplicitDir,
+        format: options.format,
+        quiet: options.quiet
+    });
 
     if (role === "client" && options.once) {
         // Once mode: shutdown after sync
@@ -139,8 +124,10 @@ program
         await startEngine("client", options);
     });
 
-program.parseAsync(process.argv).catch((err: unknown) => {
+try {
+    await program.parseAsync(process.argv);
+} catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err));
     process.stderr.write(`[ERROR] ${error.message}\n`);
     process.exit(1);
-});
+}

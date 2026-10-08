@@ -10,15 +10,21 @@ export class SyncClient {
     private isRunning = false;
     private reconnectTimeout: NodeJS.Timeout | null = null;
     private abortController: AbortController | null = null;
+    private downloadAbortController: AbortController | null = null;
 
     constructor(private readonly options: ClientOptions) {
-        this.serverUrl = options.serverUrl.replace(/\/+$/, "");
+        let url = options.serverUrl.trim();
+        while (url.endsWith("/")) {
+            url = url.slice(0, -1);
+        }
+        this.serverUrl = url;
         this.targetDir = path.resolve(options.targetDir);
         this.verbose = options.verbose ?? true;
     }
 
     public async start(): Promise<void> {
         this.isRunning = true;
+        this.downloadAbortController = new AbortController();
         fs.mkdirSync(this.targetDir, { recursive: true });
 
         if (this.verbose) {
@@ -33,27 +39,34 @@ export class SyncClient {
             return;
         }
 
-        this.connectSse(1000);
+        void this.connectSse(1000);
     }
 
     public stop(): void {
         this.isRunning = false;
         if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
         this.abortController?.abort();
-        this.reconnectTimeout = this.abortController = null;
+        this.downloadAbortController?.abort();
+        this.reconnectTimeout = this.abortController = this.downloadAbortController = null;
     }
 
     private fail(message: string): Error {
         const error = new Error(message);
+        if (!this.isRunning) return error;
+        this.stop();
         if (this.verbose) console.error(`[CLIENT] [FATAL] ${message}`);
         this.options.onError?.(error);
-        this.stop();
         return error;
     }
 
     public async syncManifest(): Promise<void> {
         try {
-            const res = await fetch(this.url("/api/manifest"));
+            if (!this.downloadAbortController || this.downloadAbortController.signal.aborted) {
+                this.downloadAbortController = new AbortController();
+            }
+            const res = await fetch(this.url("/api/manifest"), {
+                signal: this.downloadAbortController.signal
+            });
             if (res.status === 401 || res.status === 403) {
                 throw this.fail(`Authentication failed: HTTP ${res.status} (valid bearer token required)`);
             }
@@ -63,8 +76,12 @@ export class SyncClient {
             const files = Object.values(manifest.files || {});
 
             let syncedCount = 0;
-            for (const file of files) {
-                if (await this.downloadIfChanged(file)) syncedCount++;
+            const CONCURRENCY = 4;
+            for (let i = 0; i < files.length && this.isRunning; i += CONCURRENCY) {
+                const results = await Promise.all( // NOSONAR
+                    files.slice(i, i + CONCURRENCY).map((file) => this.downloadIfChanged(file))
+                );
+                syncedCount += results.filter(Boolean).length;
             }
 
             if (this.verbose) {
@@ -79,7 +96,20 @@ export class SyncClient {
         }
     }
 
+    private writeDownloadedFile(destPath: string, destDir: string, buffer: Buffer): boolean {
+        fs.mkdirSync(destDir, { recursive: true });
+        const tempPath = path.join(destDir, `.${path.basename(destPath)}.tmp.${Date.now()}`);
+        fs.writeFileSync(tempPath, buffer);
+        if (!this.isRunning) {
+            try { fs.unlinkSync(tempPath); } catch {}
+            return false;
+        }
+        fs.renameSync(tempPath, destPath);
+        return true;
+    }
+
     public async downloadIfChanged(file: SyncFileMeta): Promise<boolean> {
+        if (!this.isRunning) return false;
         const destPath = path.resolve(this.targetDir, file.name);
         const rel = path.relative(this.targetDir, destPath);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -89,33 +119,51 @@ export class SyncClient {
         fs.mkdirSync(destDir, { recursive: true });
 
         if (await verifyFileHash(destPath, file.sha256)) return false;
+        if (!this.isRunning) return false;
 
         const startMs = Date.now();
         const encodedName = file.name.split("/").map(encodeURIComponent).join("/");
-        const res = await fetch(this.url(`/api/download/${encodedName}`));
-        if (res.status === 401 || res.status === 403) {
-            throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
+        try {
+            const res = await fetch(this.url(`/api/download/${encodedName}`), {
+                signal: this.downloadAbortController?.signal
+            });
+            if (res.status === 401 || res.status === 403) {
+                throw this.fail(`Authentication failed downloading ${file.name}: HTTP ${res.status}`);
+            }
+            if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
+
+            const buffer = Buffer.from(await res.arrayBuffer());
+            if (!this.isRunning) return false;
+            const downloadedHash = computeBufferHash(buffer);
+            if (downloadedHash !== file.sha256) {
+                throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
+            }
+
+            if (!this.writeDownloadedFile(destPath, destDir, buffer)) return false;
+
+            if (this.verbose) {
+                const kb = (file.size / 1024).toFixed(1);
+                console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${Date.now() - startMs}ms -> ${destPath}`);
+            }
+
+            this.options.onSync?.(file);
+            return true;
+        } catch (err: unknown) {
+            if (!this.isRunning && err instanceof Error && err.name === "AbortError") {
+                return false;
+            }
+            throw err;
         }
-        if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
+    }
 
-        const buffer = Buffer.from(await res.arrayBuffer());
-        const downloadedHash = computeBufferHash(buffer);
-        if (downloadedHash !== file.sha256) {
-            throw new Error(`Hash mismatch for ${file.name}: expected ${file.sha256}, got ${downloadedHash}`);
+    private async readSseStream(res: Response): Promise<void> {
+        let buffer = "";
+        for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+            buffer += Buffer.from(chunk).toString("utf8");
+            const parts = buffer.split(/(?:\r?\n|\r){2}/);
+            buffer = parts.pop() || "";
+            for (const part of parts) this.processSseMessage(part.trim());
         }
-
-        fs.mkdirSync(destDir, { recursive: true });
-        const tempPath = path.join(destDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
-        fs.writeFileSync(tempPath, buffer);
-        fs.renameSync(tempPath, destPath);
-
-        if (this.verbose) {
-            const kb = (file.size / 1024).toFixed(1);
-            console.log(`[CLIENT] [SYNC] Transferred ${file.name} (${kb} KB) in ${Date.now() - startMs}ms -> ${destPath}`);
-        }
-
-        this.options.onSync?.(file);
-        return true;
     }
 
     private async connectSse(retryDelayMs = 1000): Promise<void> {
@@ -149,19 +197,11 @@ export class SyncClient {
 
             if (this.verbose) console.log("[CLIENT] Connected to real-time live sync stream. Watching for host changes...");
 
-            retryDelayMs = 1000;
-
-            let buffer = "";
-            for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
-                buffer += Buffer.from(chunk).toString("utf8");
-                const parts = buffer.split("\n\n");
-                buffer = parts.pop() || "";
-                for (const part of parts) this.processSseMessage(part.trim());
-            }
+            await this.readSseStream(res);
 
             if (!this.isRunning) return;
             if (this.verbose) console.log("[CLIENT] SSE connection closed by server.");
-            this.scheduleReconnect(retryDelayMs);
+            this.scheduleReconnect(1000);
         } catch (err: unknown) {
             if (!this.isRunning || (err instanceof Error && err.name === "AbortError")) return;
             const error = err instanceof Error ? err : new Error(String(err));
@@ -183,46 +223,70 @@ export class SyncClient {
             } catch (err: unknown) {
                 if (err instanceof Error && err.message.includes("Authentication failed")) return;
             }
-            this.connectSse(delayMs * 2);
+            void this.connectSse(delayMs * 2);
         }, delayMs);
     }
 
-    private processSseMessage(message: string): void {
-        if (!message || message.startsWith(":")) return;
-        let eventType = "message", data = "";
-        for (const line of message.split("\n")) {
+    private parseSsePayload(message: string): { eventType: string; data: string } | null {
+        if (!message || message.startsWith(":")) return null;
+        let eventType = "message";
+        let data = "";
+        for (const line of message.split(/\r?\n|\r/)) {
             if (line.startsWith("event:")) eventType = line.slice(6).trim();
             else if (line.startsWith("data:")) data = line.slice(5).trim();
         }
-        if (!data) return;
+        return data ? { eventType, data } : null;
+    }
+
+    private syncSseFile(f: SyncFileMeta): void {
+        this.downloadIfChanged(f).catch((err: unknown) => {
+            const error = err instanceof Error ? err : new Error(String(err));
+            if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
+            this.options.onError?.(error);
+        });
+    }
+
+    private handleFileDeleted(filename: string): void {
+        const destPath = path.resolve(this.targetDir, filename);
+        const rel = path.relative(this.targetDir, destPath);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+            return;
+        }
+        try {
+            fs.unlinkSync(destPath);
+        } catch {}
+        if (this.verbose) console.log(`[CLIENT] Host deleted: ${filename}`);
+        this.options.onDelete?.(filename);
+    }
+
+    private handleSseEvent(eventType: string, parsed: SyncEvent): void {
+        if (eventType === "init" && parsed.manifest?.files) {
+            for (const file of Object.values(parsed.manifest.files)) {
+                this.syncSseFile(file);
+            }
+            return;
+        }
+        if (eventType === "file_changed" && parsed.file) {
+            this.syncSseFile(parsed.file);
+            return;
+        }
+        if (eventType === "file_deleted" && parsed.filename) {
+            this.handleFileDeleted(parsed.filename);
+        }
+    }
+
+    private processSseMessage(message: string): void {
+        const payload = this.parseSsePayload(message);
+        if (!payload) return;
 
         try {
-            const parsed = JSON.parse(data) as SyncEvent;
-            const syncFile = (f: SyncFileMeta) => {
-                this.downloadIfChanged(f).catch((err: unknown) => {
-                    const error = err instanceof Error ? err : new Error(String(err));
-                    if (this.verbose) console.error(`[CLIENT] Error updating ${f.name}: ${error.message}`);
-                    this.options.onError?.(error);
-                });
-            };
-
-            if (eventType === "init" && parsed.manifest?.files) {
-                for (const file of Object.values(parsed.manifest.files)) syncFile(file);
-            } else if (eventType === "file_changed" && parsed.file) {
-                syncFile(parsed.file);
-            } else if (eventType === "file_deleted" && parsed.filename) {
-                const destPath = path.resolve(this.targetDir, parsed.filename);
-                const rel = path.relative(this.targetDir, destPath);
-                if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
-                    try { fs.unlinkSync(destPath); } catch {}
-                    if (this.verbose) console.log(`[CLIENT] Host deleted: ${parsed.filename}`);
-                    this.options.onDelete?.(parsed.filename);
-                }
-            }
+            const parsed = JSON.parse(payload.data) as SyncEvent;
+            this.handleSseEvent(payload.eventType, parsed);
         } catch {}
     }
 
     private url(endpoint: string): string {
-        return `${this.serverUrl}${endpoint}${this.options.token ? `?token=${encodeURIComponent(this.options.token)}` : ""}`;
+        const query = this.options.token ? `?token=${encodeURIComponent(this.options.token)}` : "";
+        return `${this.serverUrl}${endpoint}${query}`;
     }
 }
