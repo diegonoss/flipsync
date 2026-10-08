@@ -335,54 +335,153 @@ export async function testStandaloneClients(): Promise<void> {
             fs.rmSync(mockStopDir, { recursive: true, force: true });
         }
 
-        // 5b. Verify Client.stop() cancels an in-flight download request promptly
-        const stallServer = http.createServer((req, res) => {
-            if (req.url?.includes("/api/download/")) {
+        // 5b. Verify Client.stop() cancels overlapping queued and reconnect downloads promptly without partial writes
+        let sseConnRes: http.ServerResponse | null = null;
+        let sseClosed = false;
+        const serverSockets = new Set<any>();
+
+        const overlapServer = http.createServer((req, res) => {
+            if (req.url?.includes("/api/events")) {
+                sseConnRes = res;
+                res.writeHead(200, {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    Connection: "keep-alive"
+                });
+                res.write("event: file_changed\ndata: {\"file\":{\"name\":\"fileA.bin\",\"sha256\":\"hashA\",\"size\":1000}}\n\n");
+            } else if (req.url?.includes("/api/download/fileA.bin")) {
                 res.writeHead(200, {
                     "Content-Type": "application/octet-stream",
-                    "Content-Length": "10000"
+                    "Content-Length": "1000"
                 });
-                res.write("partial-chunk");
-                // Stall indefinitely without calling res.end()
+                res.write("chunkA");
+                // Trigger SSE drop to initiate reconnect while fileA is stalled
+                if (sseConnRes && !sseClosed) {
+                    sseClosed = true;
+                    sseConnRes.end();
+                }
+            } else if (req.url?.includes("/api/manifest")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "fileB.bin": { name: "fileB.bin", sha256: "hashB", size: 1000 }
+                    }
+                }));
+            } else if (req.url?.includes("/api/download/fileB.bin")) {
+                res.writeHead(200, {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": "1000"
+                });
+                res.write("chunkB");
+                // Stall fileB without ending
             } else {
                 res.writeHead(404).end();
             }
         });
-        await new Promise<void>((resolve) => stallServer.listen(0, "127.0.0.1", () => resolve()));
-        const stallPort = (stallServer.address() as any).port;
-        const stallUrl = `http://127.0.0.1:${stallPort}`;
+        overlapServer.on("connection", (socket) => {
+            serverSockets.add(socket);
+            socket.on("close", () => serverSockets.delete(socket));
+        });
+        await new Promise<void>((resolve) => overlapServer.listen(0, "127.0.0.1", () => resolve()));
+        const overlapPort = (overlapServer.address() as any).port;
+        const overlapUrl = `http://127.0.0.1:${overlapPort}`;
 
-        const stallTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-stall-"));
+        const overlapTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-overlap-"));
         try {
-            const stallClient = new Client({
-                server: stallUrl,
-                target: stallTargetDir,
-                once: false
+            const overlapClient = new Client({
+                server: overlapUrl,
+                target: overlapTargetDir,
+                once: false,
+                reconnectDelay: 20
             });
-            stallClient.running = true;
+            overlapClient.running = true;
+            overlapClient.connectSse(20);
 
-            const inflightPromise = stallClient.queueFile({ name: "stalled.bin", sha256: "fake", size: 10000 });
-
-            for (let i = 0; i < 20; i++) {
-                if (stallClient.activeDownloadReq) break;
+            // Wait until both download A and download B are in flight (activeDownloadReqs.size >= 2)
+            for (let i = 0; i < 50; i++) {
+                if (overlapClient.activeDownloadReqs.size >= 2) break;
                 await new Promise((r) => setTimeout(r, 20));
             }
-            assert.ok(stallClient.activeDownloadReq, "Expected activeDownloadReq to be assigned for in-flight download");
+            assert.equal(overlapClient.activeDownloadReqs.size, 2, "Expected both fileA and fileB downloads active simultaneously");
 
-            stallClient.stop();
-            assert.equal(stallClient.running, false);
-            assert.equal(stallClient.activeDownloadReq, null);
+            const queuedFilePromise = overlapClient.lastFilePromise;
+            const reconnectPromise = overlapClient.activeSyncPromise;
 
-            await assert.rejects(
-                Promise.race([
-                    inflightPromise,
-                    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout waiting for in-flight rejection")), 1000))
-                ]),
-                /Client stopped/
-            );
+            overlapClient.stop();
+            assert.equal(overlapClient.running, false);
+            assert.equal(overlapClient.activeDownloadReqs.size, 0);
+            assert.equal(overlapClient.activeDownloadReq, null);
+
+            // Assert both operations settle as stopped
+            if (queuedFilePromise) {
+                await assert.rejects(queuedFilePromise, /Client stopped/);
+            }
+            if (reconnectPromise) {
+                await assert.rejects(reconnectPromise, /Client stopped/);
+            }
+
+            // Assert neither destination nor temporary file was written
+            assert.equal(fs.existsSync(path.join(overlapTargetDir, "fileA.bin")), false);
+            assert.equal(fs.existsSync(path.join(overlapTargetDir, "fileB.bin")), false);
+            const remainingFiles = fs.readdirSync(overlapTargetDir);
+            assert.equal(remainingFiles.length, 0, "Expected no files or temporary files in target directory");
         } finally {
-            await new Promise<void>((r) => stallServer.close(() => r()));
-            fs.rmSync(stallTargetDir, { recursive: true, force: true });
+            for (const sock of serverSockets) sock.destroy();
+            await new Promise<void>((r) => overlapServer.close(() => r()));
+            fs.rmSync(overlapTargetDir, { recursive: true, force: true });
+        }
+
+        // 5c. Verify non-200 responses are consumed/destroyed promptly without leaking sockets or references
+        const errResList: http.ServerResponse[] = [];
+        const errServer = http.createServer((req, res) => {
+            errResList.push(res);
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.write("Internal server error body that remains open...");
+        });
+        await new Promise<void>((resolve) => errServer.listen(0, "127.0.0.1", () => resolve()));
+        const errPort = (errServer.address() as any).port;
+        const errUrl = `http://127.0.0.1:${errPort}`;
+
+        const errTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-err-"));
+        try {
+            const errClient = new Client({
+                server: errUrl,
+                target: errTargetDir,
+                once: false
+            });
+            errClient.running = true;
+
+            // Test httpDownload failure on 500 with unclosed body
+            for (let i = 0; i < 3; i++) {
+                await assert.rejects(
+                    errClient.httpDownload(`${errUrl}/download-fail-${i}`, `fail-${i}.bin`),
+                    /HTTP 500/
+                );
+                assert.equal(errClient.activeDownloadReqs.size, 0, "Expected no activeDownloadReqs after rejection");
+                assert.equal(errClient.activeDownloadReq, null);
+            }
+
+            // Test httpReq with asBuffer = true failure on 500 with unclosed body
+            for (let i = 0; i < 3; i++) {
+                await assert.rejects(
+                    errClient.httpReq(`${errUrl}/buffer-fail-${i}`, true),
+                    /HTTP 500/
+                );
+                assert.equal(errClient.activeDownloadReqs.size, 0, "Expected no activeDownloadReqs after rejection");
+                assert.equal(errClient.activeDownloadReq, null);
+            }
+
+            // Verify server-side sockets for those responses were closed/destroyed
+            for (const sRes of errResList) {
+                for (let i = 0; i < 20; i++) {
+                    if (sRes.socket?.destroyed) break;
+                    await new Promise((r) => setTimeout(r, 20));
+                }
+                assert.equal(sRes.socket?.destroyed, true, "Expected socket to be destroyed on client rejection");
+            }
+        } finally {
+            await new Promise<void>((r) => errServer.close(() => r()));
+            fs.rmSync(errTargetDir, { recursive: true, force: true });
         }
 
         // 6. Verify terminal sanitization on path-traversal errors and destination logs

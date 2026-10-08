@@ -188,10 +188,30 @@ class Client {
         this.once = !!opts.once;
         this.reconnectTimer = null;
         this.activeReq = null;
-        this.activeDownloadReq = null;
+        this.activeDownloadReqs = new Set();
         this.running = false;
+        this.generation = 0;
         this.downloadQueue = [];
         this.isProcessingQueue = false;
+        this.reconnectDelay = opts.reconnectDelay || 1000;
+        this.lastFilePromise = null;
+        this.activeSyncPromise = null;
+    }
+
+    /**
+     * Compatibility getter for the primary active download request.
+     * @returns {import("node:http").ClientRequest|null}
+     */
+    get activeDownloadReq() {
+        return this.activeDownloadReqs.values().next().value || null;
+    }
+
+    set activeDownloadReq(val) {
+        if (!val) {
+            this.activeDownloadReqs.clear();
+        } else {
+            this.activeDownloadReqs.add(val);
+        }
     }
 
     /**
@@ -238,6 +258,7 @@ class Client {
      */
     async start() {
         this.running = true;
+        this.generation++;
         if (!fs.existsSync(this.target)) {
             fs.mkdirSync(this.target, { recursive: true });
         }
@@ -250,7 +271,7 @@ class Client {
             return;
         }
 
-        this.connectSse(1000);
+        this.connectSse(this.reconnectDelay);
     }
 
     /**
@@ -258,6 +279,7 @@ class Client {
      */
     stop() {
         this.running = false;
+        this.generation++;
         const pending = this.downloadQueue;
         this.downloadQueue = [];
         for (const item of pending) {
@@ -271,10 +293,10 @@ class Client {
             this.activeReq.destroy(new Error("Client stopped"));
             this.activeReq = null;
         }
-        if (this.activeDownloadReq) {
-            this.activeDownloadReq.destroy(new Error("Client stopped"));
-            this.activeDownloadReq = null;
+        for (const req of Array.from(this.activeDownloadReqs)) {
+            req.destroy(new Error("Client stopped"));
         }
+        this.activeDownloadReqs.clear();
     }
 
     /**
@@ -291,21 +313,28 @@ class Client {
      * @returns {Promise<void>}
      */
     async syncAll() {
+        const opGen = this.generation;
+        if (!this.running) throw new Error("Client stopped");
         try {
             const res = await this.httpGet(this.url("/api/manifest"));
+            if (!this.running || this.generation !== opGen) throw new Error("Client stopped");
             if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${res.body}`);
             const manifest = JSON.parse(res.body);
             const files = Object.values(manifest.files || {});
             let updated = 0;
             let idx = 0;
             for (const f of files) {
+                if (!this.running || this.generation !== opGen) throw new Error("Client stopped");
                 idx++;
                 if (await this.downloadIfChanged(f, idx, files.length)) updated++;
             }
+            if (!this.running || this.generation !== opGen) throw new Error("Client stopped");
             console.log(`[CLIENT] Remote check: ${files.length} file(s) verified, ${updated} updated.`);
         } catch (err) {
-            console.error(`[CLIENT] [ERROR] Sync failed: ${err.message}`);
-            if (this.once) throw err;
+            if (this.running) {
+                console.error(`[CLIENT] [ERROR] Sync failed: ${err.message}`);
+            }
+            if (this.once || !this.running) throw err;
         }
     }
 
@@ -320,6 +349,10 @@ class Client {
      * @returns {Promise<boolean>} True if file was downloaded and written.
      */
     async downloadIfChanged(file, idx = 0, totalFiles = 0) {
+        const opGen = this.generation;
+        if (!this.running) {
+            throw new Error("Client stopped");
+        }
         const dest = path.resolve(this.target, file.name);
         const rel = path.relative(this.target, dest);
         if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -341,15 +374,29 @@ class Client {
         const encName = file.name.split("/").map(encodeURIComponent).join("/");
         const buf = await this.httpDownload(this.url(`/api/download/${encName}`), file.name, file.size, prefix);
 
+        if (!this.running || this.generation !== opGen) {
+            throw new Error("Client stopped");
+        }
+
         const hash = computeHash(buf);
         if (hash !== file.sha256) {
             throw new Error(`Hash mismatch for ${sanitizeForTerminal(file.name)}: expected ${file.sha256}, got ${hash}`);
         }
 
+        if (!this.running || this.generation !== opGen) {
+            throw new Error("Client stopped");
+        }
+
         // Atomic write
         fs.mkdirSync(parentDir, { recursive: true });
-        const tmp = path.join(parentDir, `.${path.basename(file.name)}.tmp.${Date.now()}`);
+        const tmp = path.join(parentDir, `.${path.basename(file.name)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`);
         fs.writeFileSync(tmp, buf);
+
+        if (!this.running || this.generation !== opGen) {
+            try { fs.unlinkSync(tmp); } catch {}
+            throw new Error("Client stopped");
+        }
+
         fs.renameSync(tmp, dest);
 
         const ms = Date.now() - start;
@@ -366,7 +413,7 @@ class Client {
      * Connects to the host Server-Sent Events stream for live file change updates.
      * @param {number} [backoff=1000] - Reconnection backoff delay in milliseconds.
      */
-    connectSse(backoff = 1000) {
+    connectSse(backoff = this.reconnectDelay || 1000) {
         if (!this.running) return;
 
         if (backoff > 30000) {
@@ -394,7 +441,7 @@ class Client {
 
                 console.log("[CLIENT] Live sync active. Waiting for file changes on host...");
 
-                backoff = 1000;
+                backoff = this.reconnectDelay || 1000;
 
                 let buffer = "";
                 res.on("data", (chunk) => {
@@ -436,12 +483,19 @@ class Client {
         this.reconnectTimer = setTimeout(async () => {
             if (!this.running) return;
             console.log("[CLIENT] Reconnecting to host...");
+            this.activeSyncPromise = this.syncAll();
             try {
-                await this.syncAll();
+                await this.activeSyncPromise;
             } catch (err) {
-                console.error(`[CLIENT] [ERROR] Reconnect sync failed: ${err.message}`);
+                if (this.running) {
+                    console.error(`[CLIENT] [ERROR] Reconnect sync failed: ${err.message}`);
+                }
+            } finally {
+                this.activeSyncPromise = null;
             }
-            this.connectSse(delay * 2);
+            if (this.running) {
+                this.connectSse(delay * 2);
+            }
         }, delay);
     }
 
@@ -464,7 +518,9 @@ class Client {
                 const files = Object.values(parsed.manifest.files);
                 files.forEach((f, i) => this.queueFile(f, i + 1, files.length).catch(() => {}));
             } else if (event === "file_changed" && parsed.file) {
-                this.queueFile(parsed.file).catch(() => {});
+                const p = this.queueFile(parsed.file);
+                this.lastFilePromise = p;
+                p.catch(() => {});
             } else if (event === "file_deleted" && parsed.filename) {
                 const dest = path.resolve(this.target, parsed.filename);
                 const rel = path.relative(this.target, dest);
@@ -493,29 +549,39 @@ class Client {
             const req = (parsed.protocol === "https:" ? https : http)
                 .get(parsed, (res) => {
                     if (res.statusCode === 401 || res.statusCode === 403) {
+                        this.activeDownloadReqs.delete(req);
+                        res.resume();
+                        res.destroy();
+                        req.destroy();
                         fatal(`Authentication failed (HTTP ${res.statusCode}). A valid bearer token is required.`);
                     }
                     if (asBuffer && res.statusCode !== 200) {
-                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                        this.activeDownloadReqs.delete(req);
+                        res.resume();
+                        res.destroy();
+                        req.destroy();
                         return reject(new Error(`HTTP ${res.statusCode}`));
                     }
                     const chunks = [];
                     res.on("data", (c) => chunks.push(c));
                     res.on("end", () => {
-                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                        this.activeDownloadReqs.delete(req);
                         const buf = Buffer.concat(chunks);
                         resolve(asBuffer ? buf : { status: res.statusCode || 0, body: buf.toString("utf8") });
                     });
                     res.on("error", (err) => {
-                        if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                        this.activeDownloadReqs.delete(req);
                         reject(err);
                     });
                 })
                 .on("error", (err) => {
-                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    this.activeDownloadReqs.delete(req);
                     reject(err);
                 });
-            this.activeDownloadReq = req;
+            this.activeDownloadReqs.add(req);
+            req.on("close", () => {
+                this.activeDownloadReqs.delete(req);
+            });
         });
     }
 
@@ -544,10 +610,17 @@ class Client {
             const displayName = sanitizeForTerminal(fileName);
             const req = transport.get(parsed, (res) => {
                 if (res.statusCode === 401 || res.statusCode === 403) {
+                    this.activeDownloadReqs.delete(req);
+                    res.resume();
+                    res.destroy();
+                    req.destroy();
                     fatal(`Authentication failed downloading ${displayName} (HTTP ${res.statusCode}). A valid bearer token is required.`);
                 }
                 if (res.statusCode !== 200) {
-                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    this.activeDownloadReqs.delete(req);
+                    res.resume();
+                    res.destroy();
+                    req.destroy();
                     return reject(new Error(`HTTP ${res.statusCode}`));
                 }
 
@@ -592,21 +665,24 @@ class Client {
                 });
 
                 res.on("end", () => {
-                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    this.activeDownloadReqs.delete(req);
                     if (isTTY) {
                         process.stdout.write(`\r${" ".repeat(limit)}\r`);
                     }
                     resolve(Buffer.concat(chunks));
                 });
                 res.on("error", (err) => {
-                    if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                    this.activeDownloadReqs.delete(req);
                     reject(err);
                 });
             });
 
-            this.activeDownloadReq = req;
+            this.activeDownloadReqs.add(req);
+            req.on("close", () => {
+                this.activeDownloadReqs.delete(req);
+            });
             req.on("error", (err) => {
-                if (this.activeDownloadReq === req) this.activeDownloadReq = null;
+                this.activeDownloadReqs.delete(req);
                 reject(err);
             });
         });
