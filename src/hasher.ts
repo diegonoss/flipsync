@@ -13,8 +13,8 @@ export async function computeFileHash(
     retryDelayMs = 40,
     signal?: AbortSignal
 ): Promise<{ sha256: string; size: number; mtimeMs: number } | null> {
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        if (signal?.aborted) return null;
+    const attemptRead = async (attempt: number): Promise<{ sha256: string; size: number; mtimeMs: number } | null> => {
+        if (signal?.aborted || attempt >= maxRetries) return null;
         try {
             const stat = await fs.promises.stat(filePath);
             if (!stat.isFile()) return null;
@@ -23,7 +23,7 @@ export async function computeFileHash(
             // it may be mid-truncation during a live build write. Wait once.
             if (stat.size === 0 && Date.now() - stat.mtimeMs < 500 && attempt === 0 && maxRetries > 1) {
                 await setTimeout(retryDelayMs, undefined, { signal });
-                continue;
+                return attemptRead(attempt + 1);
             }
             const hash = crypto.createHash("sha256");
             await pipeline(fs.createReadStream(filePath, { highWaterMark: 256 * 1024 }), hash, { signal });
@@ -35,9 +35,11 @@ export async function computeFileHash(
         } catch {
             if (signal?.aborted || attempt >= maxRetries - 1) return null;
             await setTimeout(retryDelayMs, undefined, { signal }).catch(() => {});
+            return attemptRead(attempt + 1);
         }
-    }
-    return null;
+    };
+
+    return attemptRead(0);
 }
 
 export async function verifyFileHash(filePath: string, expectedHash: string): Promise<boolean> {

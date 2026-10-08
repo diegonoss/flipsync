@@ -1,1 +1,1 @@
-export { runHeadlessCli } from "./index.ts";
+export * from "./index.ts";

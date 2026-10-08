@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { SyncEngine } from "../src/core/SyncEngine.js";
-import { runHeadlessCli } from "../src/cli/index.js";
+import { runHeadlessCli, startSyncCli } from "../src/cli/index.js";
+import { SyncClient } from "../src/client.js";
 import type {
     SyncEngineReadyEvent,
     SyncStartEvent,
@@ -233,11 +235,188 @@ export async function testSyncEngine(): Promise<void> {
         assert.equal(hostEngine.getState().status, "idle");
         assert.equal(hostEngine.getState().activeTransfers.length, 0);
 
+        // Test status restoration on failed manifest request
+        const reconnectEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir, token });
+        await reconnectEngine.start();
+        assert.equal(reconnectEngine.getState().status, "idle");
+
+        const origHttpRequest = (reconnectEngine as any).httpRequest;
+        (reconnectEngine as any).httpRequest = async () => { throw new Error("Network glitch"); };
+        await reconnectEngine.syncManifest();
+        assert.equal(reconnectEngine.getState().status, "idle", "Should restore status to idle after failed manifest sync");
+
+        (reconnectEngine as any).httpRequest = origHttpRequest;
+        await reconnectEngine.syncManifest();
+        assert.equal(reconnectEngine.getState().status, "idle", "Should return to idle after successful sync");
+        await reconnectEngine.stop();
+
         // Test that client without token rejects on start
         const unauthEngine = new SyncEngine({ role: "client", serverUrl: hostUrl, syncDir: clientDir });
         await assert.rejects(() => unauthEngine.start(), { message: /Authentication failed/ });
         assert.equal(unauthEngine.getState().status, "stopped");
         assert.equal((unauthEngine as any).isRunning, false);
+
+        // Test that sibling downloads cancel after auth failure with exactly one fatal error during concurrent downloads
+        const abortedSiblings = new Set<string>();
+        const pendingTimers: NodeJS.Timeout[] = [];
+        const mockServer = http.createServer((req, res) => {
+            const reqUrl = req.url ?? "";
+            if (reqUrl === "/api/manifest") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "f1.txt": { name: "f1.txt", size: 10, mtime: 1000, sha256: "fakehash1" },
+                        "f2.txt": { name: "f2.txt", size: 10, mtime: 1000, sha256: "fakehash2" },
+                        "f3.txt": { name: "f3.txt", size: 10, mtime: 1000, sha256: "fakehash3" },
+                        "f4.txt": { name: "f4.txt", size: 10, mtime: 1000, sha256: "fakehash4" }
+                    }
+                }));
+                return;
+            }
+
+            if (reqUrl === "/api/download/f1.txt") {
+                const t = setTimeout(() => {
+                    if (!res.writableEnded) {
+                        res.writeHead(401, { "Content-Type": "text/plain" });
+                        res.end("Unauthorized");
+                    }
+                }, 50);
+                pendingTimers.push(t);
+                return;
+            }
+
+            const siblingMatch = reqUrl.match(/^\/api\/download\/(f[2-4]\.txt)$/);
+            if (siblingMatch) {
+                const siblingName = siblingMatch[1];
+                res.on("close", () => {
+                    if (!res.writableEnded) {
+                        abortedSiblings.add(siblingName);
+                    }
+                });
+                const t = setTimeout(() => {
+                    if (!res.writableEnded) {
+                        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+                        res.end("1234567890");
+                    }
+                }, 500);
+                pendingTimers.push(t);
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", () => resolve()));
+        const mockPort = (mockServer.address() as any).port;
+        const mockUrl = `http://127.0.0.1:${mockPort}`;
+
+        const batchClientDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-batch-client-"));
+        try {
+            let clientErrorCount = 0;
+            const testClient = new SyncClient({
+                serverUrl: mockUrl,
+                targetDir: batchClientDir,
+                verbose: false,
+                onError: () => { clientErrorCount++; }
+            });
+
+            await assert.rejects(
+                () => testClient.start(),
+                { message: /Authentication failed downloading f1\.txt: HTTP 401/ }
+            );
+            assert.equal(clientErrorCount, 1, "Should emit exactly one fatal onError callback on auth failure");
+            assert.equal((testClient as any).isRunning, false);
+            // Wait beyond the 500ms delayed sibling response timer to ensure all in-flight siblings settle
+            await new Promise((r) => setTimeout(r, 650));
+            assert.equal(abortedSiblings.size, 3, "All 3 sibling downloads (f2, f3, f4) should be aborted via signal");
+            assert.ok(abortedSiblings.has("f2.txt"), "f2.txt download should be cancelled");
+            assert.ok(abortedSiblings.has("f3.txt"), "f3.txt download should be cancelled");
+            assert.ok(abortedSiblings.has("f4.txt"), "f4.txt download should be cancelled");
+
+            const listFilesRecursively = (dir: string): string[] => {
+                if (!fs.existsSync(dir)) return [];
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                let files: string[] = [];
+                for (const entry of entries) {
+                    const fullPath = path.join(dir, entry.name);
+                    if (entry.isDirectory()) {
+                        files = files.concat(listFilesRecursively(fullPath));
+                    } else {
+                        files.push(entry.name);
+                    }
+                }
+                return files;
+            };
+            const writtenFiles = listFilesRecursively(batchClientDir);
+            assert.equal(writtenFiles.length, 0, `No files or temporary artifacts should be written, found: ${writtenFiles.join(", ")}`);
+        } finally {
+            for (const t of pendingTimers) clearTimeout(t);
+            await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+            fs.rmSync(batchClientDir, { recursive: true, force: true });
+        }
+
+        // Test engine startup failure resets state and startSyncCli handles failure
+        const failingEngine = new SyncEngine({ role: "client", serverUrl: "http://127.0.0.1:1", syncDir: clientDir, once: true });
+        await assert.rejects(() => failingEngine.start());
+        assert.equal(failingEngine.getState().status, "stopped");
+        assert.equal((failingEngine as any).isRunning, false);
+
+        // Test TUI interactive startup fallback with injected TTY:
+        // Force the interactive path, make first engine.start reject after TUI wiring,
+        // and verify destroyTui cleans up listeners/signals/screen before headless startup succeeds.
+        const ttyEngine = new SyncEngine({ role: "client", serverUrl: "http://127.0.0.1:9999", syncDir: clientDir, once: true });
+        const origStdinIsTTY = process.stdin.isTTY;
+        const origStdoutIsTTY = process.stdout.isTTY;
+        process.stdin.isTTY = true;
+        process.stdout.isTTY = true;
+
+        let ttyStartAttempts = 0;
+        let listenersWiredInTui = 0;
+        ttyEngine.start = async () => {
+            ttyStartAttempts++;
+            if (ttyStartAttempts === 1) {
+                listenersWiredInTui = ttyEngine.listenerCount("scan:discovered");
+                throw new Error("Simulated TUI startup failure");
+            }
+            (ttyEngine as any).isRunning = true;
+            (ttyEngine as any).status = "idle";
+            return Promise.resolve();
+        };
+
+        const sigintHandlersBefore = process.listeners("SIGINT");
+        const sigtermHandlersBefore = process.listeners("SIGTERM");
+
+        try {
+            await startSyncCli(ttyEngine, { execMode: "tui", hasExplicitDir: true, quiet: true });
+            assert.equal(ttyStartAttempts, 2, "Should attempt TUI start first, then headless start on fallback");
+            assert.ok(listenersWiredInTui > 0, "TUI listeners must have been wired before startup failure");
+            assert.equal(ttyEngine.listenerCount("scan:discovered"), 0, "TUI scan:discovered listener should be removed on fallback");
+            assert.equal(ttyEngine.listenerCount("scan:complete"), 0, "TUI scan:complete listener should be removed on fallback");
+            assert.equal(ttyEngine.listenerCount("engine:pause"), 0, "TUI engine:pause listener should be removed on fallback");
+            assert.equal(ttyEngine.listenerCount("engine:resume"), 0, "TUI engine:resume listener should be removed on fallback");
+            assert.equal(ttyEngine.listenerCount("sync:cancelled"), 0, "TUI sync:cancelled listener should be removed on fallback");
+            // Only the headless signal handler should be added (TUI signal handler cleaned up)
+            assert.equal(process.listenerCount("SIGINT"), sigintHandlersBefore.length + 1, "TUI SIGINT handler should be removed on fallback");
+            assert.equal(process.listenerCount("SIGTERM"), sigtermHandlersBefore.length + 1, "TUI SIGTERM handler should be removed on fallback");
+
+            // Verify headless startup proceeds and later engine events do not touch destroyed TUI
+            ttyEngine.emit("engine:ready", { role: "client", syncDir: clientDir, filesCount: 0, endpoints: [] });
+            ttyEngine.emit("sync:start", { count: 0, files: [] });
+            ttyEngine.emit("sync:idle");
+            ttyEngine.emit("sync:error", { error: new Error("recoverable non-fatal"), context: "test" });
+        } finally {
+            process.stdin.isTTY = origStdinIsTTY;
+            process.stdout.isTTY = origStdoutIsTTY;
+            // Clean up any extra signal handlers added during headless startup
+            for (const h of process.listeners("SIGINT")) {
+                if (!sigintHandlersBefore.includes(h)) process.removeListener("SIGINT", h as any);
+            }
+            for (const h of process.listeners("SIGTERM")) {
+                if (!sigtermHandlersBefore.includes(h)) process.removeListener("SIGTERM", h as any);
+            }
+            await ttyEngine.stop();
+        }
     } finally {
         await hostEngine.stop();
         fs.rmSync(hostDir, { recursive: true, force: true });
