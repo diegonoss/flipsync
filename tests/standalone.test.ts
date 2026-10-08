@@ -528,6 +528,7 @@ export async function testStandaloneClients(): Promise<void> {
 
         let h1Started = false;
         let h2Finished = false;
+        let h1Emitted = false;
 
         const staleRaceServer = http.createServer((req, res) => {
             if (req.url?.includes("/api/events")) {
@@ -537,7 +538,10 @@ export async function testStandaloneClients(): Promise<void> {
                     "Cache-Control": "no-cache",
                     Connection: "keep-alive"
                 });
-                res.write(`event: file_changed\ndata: {"file":{"name":"race.txt","sha256":"${hashH1}","size":${contentH1.length}}}\n\n`);
+                if (!h1Emitted) {
+                    h1Emitted = true;
+                    res.write(`event: file_changed\ndata: {"file":{"name":"race.txt","sha256":"${hashH1}","size":${contentH1.length}}}\n\n`);
+                }
             } else if (req.url?.includes("/api/download/race.txt")) {
                 if (!h1Started) {
                     h1Started = true;
@@ -589,6 +593,15 @@ export async function testStandaloneClients(): Promise<void> {
             staleClient.running = true;
             staleClient.connectSse(20);
 
+            // Wait until H1 starts download and capture op1Promise
+            for (let i = 0; i < 50; i++) {
+                if (releaseH1) break;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            assert.ok(releaseH1, "Expected releaseH1 callback to be set");
+            const op1Promise = staleClient.lastFilePromise;
+            assert.ok(op1Promise, "Expected op1Promise to be set");
+
             // Wait until H2 completes from reconnect manifest
             for (let i = 0; i < 50; i++) {
                 if (h2Finished) break;
@@ -602,14 +615,10 @@ export async function testStandaloneClients(): Promise<void> {
             assert.equal(fs.readFileSync(destPath, "utf8"), contentH2);
 
             // Now release stalled H1
-            assert.ok(releaseH1, "Expected releaseH1 callback to be set");
-            const op1Promise = staleClient.lastFilePromise;
             (releaseH1 as () => void)();
 
             // Wait for op1 to settle (reject with Superseded download)
-            if (op1Promise) {
-                await assert.rejects(op1Promise, /Superseded download/);
-            }
+            await assert.rejects(op1Promise, /Superseded download/);
 
             // Small delay to ensure any asynchronous operations completed
             await new Promise((r) => setTimeout(r, 50));
