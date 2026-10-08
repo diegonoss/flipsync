@@ -237,9 +237,21 @@ function Get-FileSha256 {
     Checks for HTTP 401 or 403 unauthorized responses and terminates execution.
 #>
 function Check-AuthError {
-    param($Err, [string]$Context = "")
-    if (($Err.Exception -and $Err.Exception.Response -and [int]$Err.Exception.Response.StatusCode -in 401, 403) -or
-        ("$Err" -match '\b(401|403)\b|Unauthorized|Forbidden')) {
+    param($Err, [string]$Context = "", [int]$StatusCode = 0)
+    $isAuth = $false
+    if ($StatusCode -in 401, 403) {
+        $isAuth = $true
+    } elseif ($Err.Exception -and $Err.Exception.Response) {
+        try {
+            if ([int]$Err.Exception.Response.StatusCode -in 401, 403) {
+                $isAuth = $true
+            }
+        } catch {}
+    }
+    if (-not $isAuth -and ("$Err" -match '\b(401|403)\b|Unauthorized|Forbidden')) {
+        $isAuth = $true
+    }
+    if ($isAuth) {
         $detail = if ($Context) { " $Context" } else { "" }
         Write-Host "[CLIENT] [FATAL] Authentication failed$detail (HTTP 401/403). A valid bearer token is required." -ForegroundColor Red
         exit 1
@@ -423,7 +435,32 @@ function Sync-File {
         if ($responseStream) { $responseStream.Dispose(); $responseStream = $null }
         if ($response) { $response.Dispose(); $response = $null }
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-        Check-AuthError $_ "downloading $displayName"
+
+        $errResponse = $null
+        $statusCode = 0
+        try {
+            if ($_.Exception -and $_.Exception.Response) {
+                $errResponse = $_.Exception.Response
+                $statusCode = [int]$errResponse.StatusCode
+            }
+        } catch {}
+
+        if ($errResponse) {
+            try {
+                $errStream = $errResponse.GetResponseStream()
+                if ($errStream) {
+                    $errStream.Dispose()
+                }
+            } catch {}
+            try {
+                $errResponse.Dispose()
+            } catch {}
+        }
+        if ($req) {
+            try { $req.Abort() } catch {}
+        }
+
+        Check-AuthError $_ "downloading $displayName" $statusCode
         Write-Host "`n[ERROR] Failed downloading $($displayName): $_" -ForegroundColor Red
         return $false
     }

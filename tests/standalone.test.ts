@@ -252,6 +252,37 @@ export async function testStandaloneClients(): Promise<void> {
             } finally {
                 fs.rmSync(clientDirPs, { recursive: true, force: true });
             }
+
+            // 2c. PowerShell authentication failure termination (HTTP 401/403 after response disposal)
+            const clientDirPsAuth = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-standalone-client-ps-auth-"));
+            try {
+                let psAuthStdout = "";
+                let psAuthCode: number | null = null;
+                await new Promise<void>((resolve) => {
+                    const proc = spawn(psCmd, [
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass",
+                        "-File", psScript,
+                        "-Server", localUrl,
+                        "-Token", "bad-token",
+                        "-Target", clientDirPsAuth,
+                        "-Once"
+                    ]);
+                    proc.stdout.on("data", (d) => { psAuthStdout += d.toString(); });
+                    proc.stderr.on("data", (d) => { psAuthStdout += d.toString(); });
+                    proc.on("close", (code) => {
+                        psAuthCode = code;
+                        resolve();
+                    });
+                    proc.on("error", () => resolve());
+                });
+
+                assert.notEqual(psAuthCode, 0, "Expected non-zero exit code on PowerShell auth failure");
+                assert.match(psAuthStdout, /Authentication failed/i);
+            } finally {
+                fs.rmSync(clientDirPsAuth, { recursive: true, force: true });
+            }
         }
 
         // 3. Pseudo-Terminal (PTY) execution for real-time progress verification (POSIX only with python3 pty)
