@@ -246,25 +246,31 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
     };
 
     // Wire up SyncEngine events to TUI
-    engine.on("scan:discovered", (e: { totalFiles: number }) =>
+    const engineListeners: Array<[string, (...args: any[]) => void]> = [];
+    const bindEngine = (event: string, handler: (...args: any[]) => void) => {
+        engine.on(event, handler);
+        engineListeners.push([event, handler]);
+    };
+
+    bindEngine("scan:discovered", (e: { totalFiles: number }) =>
         addLog("INDEX", `Discovered ${e.totalFiles} file(s). Progressively indexing in background...`, "cyan"));
-    engine.on("scan:progress", scheduleRender);
-    engine.on("scan:complete", (e: { totalFiles: number }) =>
+    bindEngine("scan:progress", scheduleRender);
+    bindEngine("scan:complete", (e: { totalFiles: number }) =>
         addLog("INDEX", `Indexing complete. All ${e.totalFiles} file(s) indexed and verified.`, "green"));
-    engine.on("engine:ready", (e: SyncEngineReadyEvent) => {
+    bindEngine("engine:ready", (e: SyncEngineReadyEvent) => {
         addLog("READY", `Engine initialized. Watching ${e.filesCount} file(s) in ${e.syncDir}`, "green");
         if (e.tunnelUrl) addLog("TUNNEL", `Cloudflare public tunnel active: ${e.tunnelUrl}`, "cyan");
     });
-    engine.on("sync:start", (e: SyncStartEvent) =>
+    bindEngine("sync:start", (e: SyncStartEvent) =>
         addLog("SYNC", `Batch sync started: ${e.count} file(s)`, "blue"));
-    engine.on("sync:file-progress", scheduleRender);
-    engine.on("sync:file-complete", (e: SyncFileCompleteEvent) =>
+    bindEngine("sync:file-progress", scheduleRender);
+    bindEngine("sync:file-complete", (e: SyncFileCompleteEvent) =>
         addLog("COMPLETE", `Synchronized {bold}${e.file}{/} (${e.hash.slice(0, 8)}...)`, "green"));
-    engine.on("sync:file-served", (e: SyncFileServedEvent) =>
+    bindEngine("sync:file-served", (e: SyncFileServedEvent) =>
         addLog("SERVED", `Sent {bold}${e.file}{/} (${(e.size / 1024).toFixed(1)} KB) to ${e.clientIp}`, "cyan"));
-    engine.on("sync:conflict", (e: SyncConflictEvent) =>
+    bindEngine("sync:conflict", (e: SyncConflictEvent) =>
         addLog("CONFLICT", `Conflict on {bold}${e.file}{/}! Local: ${e.localVersion} Remote: ${e.remoteVersion}`, "magenta"));
-    engine.on("sync:error", (e: SyncErrorEvent) => {
+    bindEngine("sync:error", (e: SyncErrorEvent) => {
         const tag = e.context?.startsWith("tunnel") ? "TUNNEL" : "ERROR";
         const prefix = e.context ? `[${e.context}] ` : "";
         const lines = e.error.message.split("\n");
@@ -272,10 +278,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
             addLog(tag, `${prefix}${line}`, "red");
         }
     });
-    engine.on("sync:idle", scheduleRender);
-    engine.on("engine:pause", () => addLog("PAUSE", "Synchronization paused by user.", "yellow"));
-    engine.on("engine:resume", () => addLog("RESUME", "Synchronization resumed.", "green"));
-    engine.on("sync:cancelled", () => addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow"));
+    bindEngine("sync:idle", scheduleRender);
+    bindEngine("engine:pause", () => addLog("PAUSE", "Synchronization paused by user.", "yellow"));
+    bindEngine("engine:resume", () => addLog("RESUME", "Synchronization resumed.", "green"));
+    bindEngine("sync:cancelled", () => addLog("CANCEL", "Data transfers and file scan cancelled.", "yellow"));
 
     // Keybindings & Shutdown
     let renderInterval: NodeJS.Timeout | null = null;
@@ -288,6 +294,10 @@ export async function runTui(engine: SyncEngine, options: TuiOptions = {}): Prom
         if (renderInterval) clearInterval(renderInterval);
         process.removeListener("SIGINT", onSigInt);
         process.removeListener("SIGTERM", onSigTerm);
+        for (const [event, handler] of engineListeners) {
+            engine.removeListener(event, handler);
+        }
+        engineListeners.length = 0;
         try { activeCommandModal?.close(); } catch {}
         try { screen.destroy(); } catch {}
         process.stdout.write("\x1b[?1049l\x1b[?25h");

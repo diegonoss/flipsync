@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { SyncEngine } from "../src/core/SyncEngine.js";
@@ -255,18 +256,84 @@ export async function testSyncEngine(): Promise<void> {
         assert.equal(unauthEngine.getState().status, "stopped");
         assert.equal((unauthEngine as any).isRunning, false);
 
-        // Test that sibling downloads cancel after auth failure with exactly one fatal error
-        let clientErrorCount = 0;
-        const testClient = new SyncClient({
-            serverUrl: hostUrl,
-            targetDir: clientDir,
-            token: "invalid-token",
-            verbose: false,
-            onError: () => { clientErrorCount++; }
+        // Test that sibling downloads cancel after auth failure with exactly one fatal error during concurrent downloads
+        let siblingAbortedCount = 0;
+        const pendingTimers: NodeJS.Timeout[] = [];
+        const mockServer = http.createServer((req, res) => {
+            const reqUrl = req.url ?? "";
+            if (reqUrl === "/api/manifest") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({
+                    files: {
+                        "f1.txt": { name: "f1.txt", size: 10, mtime: 1000, sha256: "fakehash1" },
+                        "f2.txt": { name: "f2.txt", size: 10, mtime: 1000, sha256: "fakehash2" },
+                        "f3.txt": { name: "f3.txt", size: 10, mtime: 1000, sha256: "fakehash3" },
+                        "f4.txt": { name: "f4.txt", size: 10, mtime: 1000, sha256: "fakehash4" }
+                    }
+                }));
+                return;
+            }
+
+            if (reqUrl === "/api/download/f1.txt") {
+                const t = setTimeout(() => {
+                    if (!res.writableEnded) {
+                        res.writeHead(401, { "Content-Type": "text/plain" });
+                        res.end("Unauthorized");
+                    }
+                }, 50);
+                pendingTimers.push(t);
+                return;
+            }
+
+            if (reqUrl.startsWith("/api/download/")) {
+                res.on("close", () => {
+                    if (!res.writableEnded) {
+                        siblingAbortedCount++;
+                    }
+                });
+                const t = setTimeout(() => {
+                    if (!res.writableEnded) {
+                        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+                        res.end("1234567890");
+                    }
+                }, 500);
+                pendingTimers.push(t);
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
         });
-        await assert.rejects(() => testClient.start(), { message: /Authentication failed/ });
-        assert.equal(clientErrorCount, 1, "Should emit exactly one fatal onError callback on auth failure");
-        assert.equal((testClient as any).isRunning, false);
+
+        await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", () => resolve()));
+        const mockPort = (mockServer.address() as any).port;
+        const mockUrl = `http://127.0.0.1:${mockPort}`;
+
+        const batchClientDir = fs.mkdtempSync(path.join(os.tmpdir(), "flipsync-test-batch-client-"));
+        try {
+            let clientErrorCount = 0;
+            const testClient = new SyncClient({
+                serverUrl: mockUrl,
+                targetDir: batchClientDir,
+                verbose: false,
+                onError: () => { clientErrorCount++; }
+            });
+
+            await assert.rejects(
+                () => testClient.start(),
+                { message: /Authentication failed downloading f1\.txt: HTTP 401/ }
+            );
+            assert.equal(clientErrorCount, 1, "Should emit exactly one fatal onError callback on auth failure");
+            assert.equal((testClient as any).isRunning, false);
+            // Allow event loop tick for socket close events on aborted in-flight downloads
+            await new Promise((r) => setTimeout(r, 100));
+            assert.ok(siblingAbortedCount >= 1, "In-flight sibling downloads should be cancelled via abort signal");
+            assert.equal(fs.readdirSync(batchClientDir).length, 0, "No files should be written on auth failure");
+        } finally {
+            for (const t of pendingTimers) clearTimeout(t);
+            await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+            fs.rmSync(batchClientDir, { recursive: true, force: true });
+        }
 
         // Test engine startup failure resets state and startSyncCli handles failure
         const failingEngine = new SyncEngine({ role: "client", serverUrl: "http://127.0.0.1:1", syncDir: clientDir, once: true });
@@ -278,6 +345,11 @@ export async function testSyncEngine(): Promise<void> {
         await assert.rejects(() => startSyncCli(cliFailingEngine, { execMode: "tui", hasExplicitDir: true }));
         assert.equal(cliFailingEngine.getState().status, "stopped");
         assert.equal((cliFailingEngine as any).isRunning, false);
+        assert.equal(cliFailingEngine.listenerCount("scan:discovered"), 0, "TUI listeners should be removed on fallback");
+        assert.equal(cliFailingEngine.listenerCount("scan:complete"), 0);
+        assert.equal(cliFailingEngine.listenerCount("engine:pause"), 0);
+        assert.equal(cliFailingEngine.listenerCount("engine:resume"), 0);
+        assert.equal(cliFailingEngine.listenerCount("sync:cancelled"), 0);
     } finally {
         await hostEngine.stop();
         fs.rmSync(hostDir, { recursive: true, force: true });
